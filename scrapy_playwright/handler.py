@@ -1,8 +1,11 @@
 import asyncio
 import logging
+import os
 import platform
+import re
 from contextlib import suppress
 from dataclasses import dataclass, field as dataclass_field
+from datetime import datetime, timezone
 from functools import partial
 from ipaddress import ip_address
 from time import time
@@ -35,6 +38,7 @@ from scrapy.utils.reactor import verify_installed_reactor
 from twisted.internet.defer import Deferred, inlineCallbacks
 
 from scrapy_playwright.headers import use_scrapy_headers
+from scrapy_playwright.network_recorder import NetworkRecorder
 from scrapy_playwright.page import PageMethod
 from scrapy_playwright._utils import (
     _ThreadedLoopAdapter,
@@ -69,6 +73,7 @@ class BrowserContextWrapper:
     context: BrowserContext
     semaphore: asyncio.Semaphore
     persistent: bool
+    recorder: Optional[NetworkRecorder] = None
 
 
 @dataclass
@@ -97,8 +102,12 @@ class Config:
     startup_context_kwargs: dict
     navigation_timeout: Optional[float]
     restart_disconnected_browser: bool
+    close_page_after_request: bool
     target_closed_max_retries: int = 3
     use_threaded_loop: bool = False
+    har_recording: bool = False
+    har_output_dir: str = "har_recordings"
+    har_url_filter: Optional[str] = None
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Config":
@@ -122,8 +131,14 @@ class Config:
             restart_disconnected_browser=settings.getbool(
                 "PLAYWRIGHT_RESTART_DISCONNECTED_BROWSER", default=True
             ),
+            close_page_after_request=settings.getbool(
+                "PLAYWRIGHT_CLOSE_PAGE_AFTER_REQUEST", default=False
+            ),
             use_threaded_loop=platform.system() == "Windows"
             or settings.getbool("_PLAYWRIGHT_THREADED_LOOP", False),
+            har_recording=settings.getbool("PLAYWRIGHT_HAR_RECORDING", default=False),
+            har_output_dir=settings.get("PLAYWRIGHT_HAR_OUTPUT_DIR", "debug/har_recordings"),
+            har_url_filter=settings.get("PLAYWRIGHT_HAR_URL_FILTER"),
         )
         cfg.cdp_kwargs.pop("endpoint_url", None)
         cfg.connect_kwargs.pop("ws_endpoint", None)
@@ -247,6 +262,28 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                 self.stats.inc_value("playwright/browser_count")
                 self.browser.on("disconnected", self._browser_disconnected_callback)
 
+    def _create_network_recorder(
+        self, name: str, context_kwargs: dict,
+    ) -> Optional[NetworkRecorder]:
+        """Create a NetworkRecorder if HAR recording is enabled.
+        Checks per-request _playwright_har override, then global config.
+        """
+        har_meta = context_kwargs.pop("_playwright_har", None)
+        if har_meta is False:
+            return None
+        if not (har_meta is not None or self.config.har_recording):
+            return None
+
+        url_filter = self.config.har_url_filter
+        if isinstance(har_meta, dict) and har_meta.get("url_filter"):
+            url_filter = har_meta["url_filter"]
+
+        return NetworkRecorder(
+            output_dir=self.config.har_output_dir,
+            context_name=name,
+            url_filter=url_filter,
+        )
+
     async def _create_browser_context(
         self,
         name: str,
@@ -259,6 +296,17 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         if hasattr(self, "context_semaphore"):
             await self.context_semaphore.acquire()
         context_kwargs = context_kwargs or {}
+
+        # Create network recorder if HAR recording is enabled
+        recorder = self._create_network_recorder(name, context_kwargs)
+        if recorder:
+            logger.info(
+                "Network recording enabled for context '%s': %s",
+                name, recorder.base_dir,
+                extra={"spider": spider, "context_name": name},
+            )
+            self.stats.inc_value("playwright/har_recording_contexts")
+
         persistent = remote = False
         if context_kwargs.get(PERSISTENT_CONTEXT_PATH_KEY):
             context = await self.browser_type.launch_persistent_context(**context_kwargs)
@@ -276,7 +324,9 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             context = await self.browser.new_context(**context_kwargs)
 
         context.on(
-            "close", self._make_close_browser_context_callback(name, persistent, remote, spider)
+            "close", self._make_close_browser_context_callback(
+                name, persistent, remote, spider, recorder=recorder,
+            )
         )
         self.stats.inc_value("playwright/context_count")
         self.stats.inc_value(f"playwright/context_count/persistent/{persistent}")
@@ -299,6 +349,7 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             context=context,
             semaphore=asyncio.Semaphore(value=self.config.max_pages_per_context),
             persistent=persistent,
+            recorder=recorder,
         )
         self._set_max_concurrent_context_count()
         return self.context_wrappers[name]
@@ -311,9 +362,14 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         async with self.context_launch_lock:
             ctx_wrapper = self.context_wrappers.get(context_name)
             if ctx_wrapper is None:
+                context_kwargs = dict(request.meta.get("playwright_context_kwargs") or {})
+                # Support playwright_har meta: True, False, or dict of HAR options
+                har_meta = request.meta.get("playwright_har")
+                if har_meta is not None:
+                    context_kwargs["_playwright_har"] = har_meta
                 ctx_wrapper = await self._create_browser_context(
                     name=context_name,
-                    context_kwargs=request.meta.get("playwright_context_kwargs"),
+                    context_kwargs=context_kwargs,
                     spider=spider,
                 )
 
@@ -343,6 +399,8 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         page.on("crash", self._make_close_page_callback(context_name))
         page.on("request", self._increment_request_stats)
         page.on("response", self._increment_response_stats)
+        if ctx_wrapper.recorder:
+            page.on("response", ctx_wrapper.recorder.on_response)
         if logger.getEffectiveLevel() <= logging.DEBUG:
             page.on("request", _make_request_logger(context_name, spider))
             page.on("response", _make_response_logger(context_name, spider))
@@ -385,6 +443,12 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                 _ThreadedLoopAdapter.stop(id(self))
 
     async def _close(self) -> None:
+        for ctx in self.context_wrappers.values():
+            if ctx.recorder:
+                ctx.recorder.finalize()
+                self.stats.set_value(
+                    "playwright/har_entry_count", ctx.recorder.entry_count,
+                )
         with suppress(TargetClosedError):
             await asyncio.gather(*[ctx.context.close() for ctx in self.context_wrappers.values()])
         self.context_wrappers.clear()
@@ -419,6 +483,10 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
 
     async def _download_request(self, request: Request, spider: Spider | None = None) -> Response:
         spider = spider or self._crawler.spider
+
+        if request.meta.get("playwright_fetch"):
+            return await self._download_request_with_fetch(request=request, spider=spider)
+
         counter = 0
         while True:
             try:
@@ -437,6 +505,154 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                         "exception": ex,
                     },
                 )
+
+    def _should_close_page(self, request: Request) -> bool:
+        return self.config.close_page_after_request and not request.meta.get(
+            "playwright_include_page"
+        )
+
+    # ── Fetch-style download (page.evaluate + fetch) ───────────────────
+
+    async def _get_or_create_fetch_page(self, request: Request, spider: Spider) -> Page:
+        """Return an open page suitable for running fetch() inside.
+
+        Reuses the first open page in the target context.  If none exist,
+        creates a new page and navigates it to a seed URL so that
+        same-origin fetch calls carry the correct cookies / CF tokens.
+        """
+        context_name = request.meta.get("playwright_fetch_context") or DEFAULT_CONTEXT_NAME
+        request.meta.setdefault("playwright_context", context_name)
+
+        async with self.context_launch_lock:
+            ctx_wrapper = self.context_wrappers.get(context_name)
+            if ctx_wrapper is None:
+                ctx_wrapper = await self._create_browser_context(
+                    name=context_name, context_kwargs=None, spider=spider,
+                )
+
+        # Try to reuse an existing, non-closed page
+        for page in ctx_wrapper.context.pages:
+            if not page.is_closed():
+                return page
+
+        # No usable page — create one and navigate to a seed URL
+        seed_url = (
+            request.meta.get("playwright_fetch_seed_url")
+            or _get_header_value(request.headers, b"Referer")
+            or _get_header_value(request.headers, b"Origin")
+        )
+        if not seed_url:
+            from urllib.parse import urlparse
+            parsed = urlparse(request.url)
+            seed_url = f"{parsed.scheme}://{parsed.netloc}/"
+
+        logger.info(
+            "[Fetch] No open page in context '%s', creating one and seeding with %s",
+            context_name, seed_url,
+        )
+        await ctx_wrapper.semaphore.acquire()
+        page = await ctx_wrapper.context.new_page()
+        self.stats.inc_value("playwright/page_count")
+        self._set_max_concurrent_page_count()
+        if self.config.navigation_timeout is not None:
+            page.set_default_navigation_timeout(self.config.navigation_timeout)
+
+        page.on("close", self._make_close_page_callback(context_name))
+        page.on("crash", self._make_close_page_callback(context_name))
+        page.on("request", self._increment_request_stats)
+        page.on("response", self._increment_response_stats)
+        if ctx_wrapper.recorder:
+            page.on("response", ctx_wrapper.recorder.on_response)
+
+        await page.goto(seed_url, wait_until="domcontentloaded")
+        return page
+
+    @staticmethod
+    def _build_fetch_js(url: str, method: str, headers: dict, body: Optional[str]) -> str:
+        """Return a JS expression that calls fetch() and resolves to a
+        serialisable {status, statusText, headers, body} object."""
+        import json as _json
+        fetch_opts: dict = {
+            "method": method,
+            "headers": headers,
+            "credentials": "include",
+        }
+        if body is not None:
+            fetch_opts["body"] = body
+
+        opts_json = _json.dumps(fetch_opts, ensure_ascii=False)
+        return (
+            f"async () => {{"
+            f"  const r = await fetch({_json.dumps(url)}, {opts_json});"
+            f"  const hdrs = {{}};"
+            f"  r.headers.forEach((v, k) => {{ hdrs[k] = v; }});"
+            f"  const text = await r.text();"
+            f"  return {{status: r.status, statusText: r.statusText, headers: hdrs, body: text}};"
+            f"}}"
+        )
+
+    async def _download_request_with_fetch(
+        self, request: Request, spider: Spider,
+    ) -> Response:
+        """Execute the request as a fetch() call inside an open browser page."""
+        start_time = time()
+
+        page = await self._get_or_create_fetch_page(request, spider)
+
+        # Build header dict from Scrapy headers
+        hdrs: dict = {}
+        for key, values in request.headers.items():
+            name = key.decode("utf-8") if isinstance(key, bytes) else key
+            val = values[-1] if isinstance(values, list) else values
+            hdrs[name] = val.decode("utf-8") if isinstance(val, bytes) else val
+
+        body_str: Optional[str] = None
+        if request.body:
+            body_str = request.body.decode(request.encoding)
+
+        js_code = self._build_fetch_js(
+            url=request.url,
+            method=request.method,
+            headers=hdrs,
+            body=body_str,
+        )
+
+        logger.info(
+            "[Fetch] Executing fetch: %s %s (body_len=%s, page_url=%s)",
+            request.method, request.url,
+            len(body_str) if body_str else 0,
+            page.url,
+        )
+
+        result = await page.evaluate(js_code)
+
+        status = result["status"]
+        resp_headers = Headers(result.get("headers") or {})
+        resp_headers.pop("Content-Encoding", None)
+        resp_body_text = result.get("body", "")
+
+        logger.info(
+            "[Fetch] Response: %s %s status=%s body_len=%s",
+            request.method, request.url, status, len(resp_body_text),
+        )
+
+        body_bytes, encoding = _encode_body(headers=resp_headers, text=resp_body_text)
+        request.meta["download_latency"] = time() - start_time
+
+        respcls = responsetypes.from_args(headers=resp_headers, url=request.url, body=body_bytes)
+        self.stats.inc_value("playwright/fetch_count")
+
+        return respcls(
+            url=request.url,
+            status=status,
+            headers=resp_headers,
+            body=body_bytes,
+            request=request,
+            flags=["playwright", "playwright_fetch"],
+            encoding=encoding,
+        )
+
+    # ── Navigation-style download (page.goto) ──────────────────────────
 
     async def _download_request_with_retry(self, request: Request, spider: Spider) -> Response:
         page = request.meta.get("playwright_page")
@@ -477,7 +693,7 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         try:
             return await self._download_request_with_page(request, page, spider)
         except Exception as ex:
-            if not request.meta.get("playwright_include_page") and not page.is_closed():
+            if self._should_close_page(request) and not page.is_closed():
                 logger.warning(
                     "Closing page due to failed request: %s exc_type=%s exc_msg=%s",
                     request,
@@ -543,7 +759,7 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         if download and download.exception:
             raise download.exception
 
-        if not request.meta.get("playwright_include_page"):
+        if self._should_close_page(request):
             await page.close()
             self.stats.inc_value("playwright/page_count/closed")
 
@@ -703,6 +919,9 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         self.stats.inc_value(f"{stats_prefix}/method/{response.request.method}")
 
     async def _browser_disconnected_callback(self) -> None:
+        for ctx_wrapper in self.context_wrappers.values():
+            if ctx_wrapper.recorder:
+                ctx_wrapper.recorder.finalize()
         close_context_coros = [
             ctx_wrapper.context.close() for ctx_wrapper in self.context_wrappers.values()
         ]
@@ -721,12 +940,22 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         return close_page_callback
 
     def _make_close_browser_context_callback(
-        self, name: str, persistent: bool, remote: bool, spider: Optional[Spider] = None
+        self,
+        name: str,
+        persistent: bool,
+        remote: bool,
+        spider: Optional[Spider] = None,
+        recorder: Optional[NetworkRecorder] = None,
     ) -> Callable:
         def close_browser_context_callback() -> None:
             self.context_wrappers.pop(name, None)
             if hasattr(self, "context_semaphore"):
                 self.context_semaphore.release()
+            if recorder:
+                recorder.finalize()
+                self.stats.set_value(
+                    "playwright/har_entry_count", recorder.entry_count,
+                )
             logger.debug(
                 "Browser context closed: '%s' (persistent=%s, remote=%s)",
                 name,
