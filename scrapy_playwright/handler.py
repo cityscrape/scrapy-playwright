@@ -172,8 +172,14 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         else:
             crawler.signals.connect(self._engine_started, signals.engine_started)
 
+        self._is_closing = False
+        self._driver_dead = False
+
+        crawler.signals.connect(self._spider_closed, signals.spider_closed)
+
         self.browser_launch_lock = asyncio.Lock()
         self.context_launch_lock = asyncio.Lock()
+        self.playwright_restart_lock = asyncio.Lock()
         self.context_wrappers: Dict[str, BrowserContextWrapper] = {}
         if self.config.max_contexts:
             self.context_semaphore = asyncio.Semaphore(value=self.config.max_contexts)
@@ -192,6 +198,17 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         self.abort_request: Optional[Callable[[PlaywrightRequest], Union[Awaitable, bool]]] = None
         if crawler.settings.get("PLAYWRIGHT_ABORT_REQUEST"):
             self.abort_request = load_object(crawler.settings["PLAYWRIGHT_ABORT_REQUEST"])
+
+    def _spider_closed(self, spider: Spider, reason: str) -> None:
+        logger.info(
+            "[Lifecycle] _spider_closed ENTER reason=%s, _is_closing was %s, "
+            "context_wrappers=%s, has_browser=%s",
+            reason, self._is_closing,
+            list(self.context_wrappers.keys()),
+            hasattr(self, "browser"),
+        )
+        self._is_closing = True
+        logger.info("[Lifecycle] _spider_closed DONE, _is_closing=True")
 
     @classmethod
     def from_crawler(cls: Type[PlaywrightHandler], crawler: Crawler) -> PlaywrightHandler:
@@ -231,17 +248,89 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             logger.info("Startup context(s) launched")
             self.stats.set_value("playwright/page_count", self._get_total_page_count())
 
+    async def _restart_playwright(self) -> None:
+        """Restart the Playwright driver (Node.js subprocess) after it has died.
+
+        This tears down any stale state and starts a fresh PlaywrightContextManager,
+        giving us a new driver process and a new browser_type.
+        """
+        async with self.playwright_restart_lock:
+            if not self._driver_dead:
+                # Another coroutine already restarted successfully
+                return
+
+            logger.info(
+                "[Lifecycle] _restart_playwright ENTER, _driver_dead=%s, "
+                "has_browser=%s, context_wrappers=%s",
+                self._driver_dead,
+                hasattr(self, "browser"),
+                list(self.context_wrappers.keys()),
+            )
+
+            # Clean up stale state
+            self.context_wrappers.clear()
+            if hasattr(self, "browser"):
+                del self.browser
+
+            # Tear down old playwright driver (best effort)
+            if self.playwright_context_manager:
+                with suppress(Exception):
+                    await self.playwright_context_manager.__aexit__()
+            if self.playwright:
+                with suppress(Exception):
+                    await self.playwright.stop()
+
+            # Start fresh driver
+            self.playwright_context_manager = PlaywrightContextManager()
+            self.playwright = await self.playwright_context_manager.start()
+            self.browser_type = getattr(self.playwright, self.config.browser_type_name)
+            self._driver_dead = False
+            self.stats.inc_value("playwright/driver_restart_count")
+
+            logger.info(
+                "[Lifecycle] _restart_playwright DONE, new driver ready, "
+                "browser_type=%s",
+                self.browser_type.name,
+            )
+
     async def _maybe_launch_browser(self) -> None:
         async with self.browser_launch_lock:
+            # If the driver is dead, we can't launch — the caller must
+            # restart the driver first via _restart_playwright().
+            if self._driver_dead:
+                raise Exception(
+                    "Connection closed while reading from the driver"
+                )
+            if hasattr(self, "browser") and not self.browser.is_connected():
+                logger.warning(
+                    "[Lifecycle] _maybe_launch_browser: browser disconnected, clearing. "
+                    "_is_closing=%s",
+                    self._is_closing,
+                )
+                del self.browser
             if not hasattr(self, "browser"):
-                logger.info("Launching browser %s", self.browser_type.name)
+                logger.info(
+                    "[Lifecycle] _maybe_launch_browser: launching %s, _is_closing=%s",
+                    self.browser_type.name, self._is_closing,
+                )
                 self.browser = await self.browser_type.launch(**self.config.launch_options)
-                logger.info("Browser %s launched", self.browser_type.name)
+                logger.info(
+                    "[Lifecycle] _maybe_launch_browser: browser launched, _is_closing=%s",
+                    self._is_closing,
+                )
                 self.stats.inc_value("playwright/browser_count")
                 self.browser.on("disconnected", self._browser_disconnected_callback)
+            else:
+                logger.debug(
+                    "[Lifecycle] _maybe_launch_browser: browser already connected, _is_closing=%s",
+                    self._is_closing,
+                )
 
     async def _maybe_connect_remote_devtools(self) -> None:
         async with self.browser_launch_lock:
+            if hasattr(self, "browser") and not self.browser.is_connected():
+                logger.warning("Browser is disconnected. Clearing to reconnect to CDP: %s", self.config.cdp_url)
+                del self.browser
             if not hasattr(self, "browser"):
                 logger.info("Connecting using CDP: %s", self.config.cdp_url)
                 self.browser = await self.browser_type.connect_over_cdp(
@@ -253,6 +342,9 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
 
     async def _maybe_connect_remote(self) -> None:
         async with self.browser_launch_lock:
+            if hasattr(self, "browser") and not self.browser.is_connected():
+                logger.warning("Browser is disconnected. Clearing to reconnect to remote Playwright: %s", self.config.connect_url)
+                del self.browser
             if not hasattr(self, "browser"):
                 logger.info("Connecting to remote Playwright")
                 self.browser = await self.browser_type.connect(
@@ -293,6 +385,13 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         """Create a new context, also launching a local browser or connecting
         to a remote one if necessary.
         """
+        logger.debug(
+            "[Lifecycle] _create_browser_context ENTER name='%s', _is_closing=%s, "
+            "has_context_sem=%s, has_browser=%s",
+            name, self._is_closing,
+            hasattr(self, "context_semaphore"),
+            hasattr(self, "browser"),
+        )
         if hasattr(self, "context_semaphore"):
             await self.context_semaphore.acquire()
         context_kwargs = context_kwargs or {}
@@ -307,52 +406,57 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             )
             self.stats.inc_value("playwright/har_recording_contexts")
 
-        persistent = remote = False
-        if context_kwargs.get(PERSISTENT_CONTEXT_PATH_KEY):
-            context = await self.browser_type.launch_persistent_context(**context_kwargs)
-            persistent = True
-        elif self.config.cdp_url:
-            await self._maybe_connect_remote_devtools()
-            context = await self.browser.new_context(**context_kwargs)
-            remote = True
-        elif self.config.connect_url:
-            await self._maybe_connect_remote()
-            context = await self.browser.new_context(**context_kwargs)
-            remote = True
-        else:
-            await self._maybe_launch_browser()
-            context = await self.browser.new_context(**context_kwargs)
+        try:
+            persistent = remote = False
+            if context_kwargs.get(PERSISTENT_CONTEXT_PATH_KEY):
+                context = await self.browser_type.launch_persistent_context(**context_kwargs)
+                persistent = True
+            elif self.config.cdp_url:
+                await self._maybe_connect_remote_devtools()
+                context = await self.browser.new_context(**context_kwargs)
+                remote = True
+            elif self.config.connect_url:
+                await self._maybe_connect_remote()
+                context = await self.browser.new_context(**context_kwargs)
+                remote = True
+            else:
+                await self._maybe_launch_browser()
+                context = await self.browser.new_context(**context_kwargs)
 
-        context.on(
-            "close", self._make_close_browser_context_callback(
-                name, persistent, remote, spider, recorder=recorder,
+            context.on(
+                "close", self._make_close_browser_context_callback(
+                    name, persistent, remote, spider, recorder=recorder,
+                )
             )
-        )
-        self.stats.inc_value("playwright/context_count")
-        self.stats.inc_value(f"playwright/context_count/persistent/{persistent}")
-        self.stats.inc_value(f"playwright/context_count/remote/{remote}")
-        logger.debug(
-            "Browser context started: '%s' (persistent=%s, remote=%s)",
-            name,
-            persistent,
-            remote,
-            extra={
-                "spider": spider,
-                "context_name": name,
-                "persistent": persistent,
-                "remote": remote,
-            },
-        )
-        if self.config.navigation_timeout is not None:
-            context.set_default_navigation_timeout(self.config.navigation_timeout)
-        self.context_wrappers[name] = BrowserContextWrapper(
-            context=context,
-            semaphore=asyncio.Semaphore(value=self.config.max_pages_per_context),
-            persistent=persistent,
-            recorder=recorder,
-        )
-        self._set_max_concurrent_context_count()
-        return self.context_wrappers[name]
+            self.stats.inc_value("playwright/context_count")
+            self.stats.inc_value(f"playwright/context_count/persistent/{persistent}")
+            self.stats.inc_value(f"playwright/context_count/remote/{remote}")
+            logger.debug(
+                "Browser context started: '%s' (persistent=%s, remote=%s)",
+                name,
+                persistent,
+                remote,
+                extra={
+                    "spider": spider,
+                    "context_name": name,
+                    "persistent": persistent,
+                    "remote": remote,
+                },
+            )
+            if self.config.navigation_timeout is not None:
+                context.set_default_navigation_timeout(self.config.navigation_timeout)
+            self.context_wrappers[name] = BrowserContextWrapper(
+                context=context,
+                semaphore=asyncio.Semaphore(value=self.config.max_pages_per_context),
+                persistent=persistent,
+                recorder=recorder,
+            )
+            self._set_max_concurrent_context_count()
+            return self.context_wrappers[name]
+        except Exception:
+            if hasattr(self, "context_semaphore"):
+                self.context_semaphore.release()
+            raise
 
     async def _create_page(self, request: Request, spider: Spider) -> Page:
         """Create a new page in a context, also creating a new context if necessary."""
@@ -426,44 +530,76 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
     if _SCRAPY_ASYNC_API:
 
         async def close(self) -> None:
-            logger.info("Closing download handler")
+            logger.info(
+                "[Lifecycle] close() ENTER (async API), _is_closing=%s",
+                self._is_closing,
+            )
             await super().close()
             await self._maybe_future_from_coro(self._close())
             if self.config.use_threaded_loop:
                 _ThreadedLoopAdapter.stop(id(self))
+            logger.info("[Lifecycle] close() DONE")
 
     else:
 
         @inlineCallbacks
         def close(self) -> Deferred:  # pylint: disable=invalid-overridden-method
-            logger.info("Closing download handler")
+            logger.info(
+                "[Lifecycle] close() ENTER (legacy API), _is_closing=%s",
+                self._is_closing,
+            )
             yield super().close()
             yield self._deferred_from_coro(self._close())
             if self.config.use_threaded_loop:
                 _ThreadedLoopAdapter.stop(id(self))
+            logger.info("[Lifecycle] close() DONE")
 
     async def _close(self) -> None:
+        logger.info(
+            "[Lifecycle] _close() ENTER, _is_closing was %s, context_wrappers=%s, "
+            "has_browser=%s",
+            self._is_closing, list(self.context_wrappers.keys()),
+            hasattr(self, "browser"),
+        )
+        self._is_closing = True
         for ctx in self.context_wrappers.values():
             if ctx.recorder:
                 ctx.recorder.finalize()
                 self.stats.set_value(
                     "playwright/har_entry_count", ctx.recorder.entry_count,
                 )
+        ctx_names = list(self.context_wrappers.keys())
+        logger.debug("[Lifecycle] _close() closing %d contexts: %s", len(ctx_names), ctx_names)
         with suppress(TargetClosedError):
             await asyncio.gather(*[ctx.context.close() for ctx in self.context_wrappers.values()])
         self.context_wrappers.clear()
+        logger.debug("[Lifecycle] _close() contexts cleared")
         if hasattr(self, "browser"):
-            logger.info("Closing browser")
+            logger.info("[Lifecycle] _close() closing browser")
             await self.browser.close()
+            logger.debug("[Lifecycle] _close() browser closed")
+        else:
+            logger.debug("[Lifecycle] _close() no browser to close")
         if self.playwright_context_manager:
-            await self.playwright_context_manager.__aexit__()
+            logger.debug("[Lifecycle] _close() stopping playwright context manager")
+            with suppress(Exception):
+                await self.playwright_context_manager.__aexit__()
         if self.playwright:
-            await self.playwright.stop()
+            logger.debug("[Lifecycle] _close() stopping playwright")
+            with suppress(Exception):
+                await self.playwright.stop()
+        logger.info("[Lifecycle] _close() DONE")
 
     if _SCRAPY_ASYNC_API:
 
         async def download_request(self, request: Request) -> Response:
             if request.meta.get("playwright"):
+                logger.debug(
+                    "[Lifecycle] download_request ENTER (async API) %s %s, "
+                    "_is_closing=%s, playwright_fetch=%s",
+                    request.method, request.url,
+                    self._is_closing, request.meta.get("playwright_fetch"),
+                )
                 coro = self._download_request(request)
                 return await self._maybe_future_from_coro(coro)
             return await super().download_request(  # pylint: disable=no-value-for-parameter
@@ -476,6 +612,12 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             self, request: Request, spider: Spider
         ) -> Deferred:
             if request.meta.get("playwright"):
+                logger.debug(
+                    "[Lifecycle] download_request ENTER (legacy API) %s %s, "
+                    "_is_closing=%s, playwright_fetch=%s",
+                    request.method, request.url,
+                    self._is_closing, request.meta.get("playwright_fetch"),
+                )
                 return self._deferred_from_coro(self._download_request(request, spider))
             return super().download_request(  # pylint: disable=unexpected-keyword-arg
                 request=request, spider=spider
@@ -484,27 +626,100 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
     async def _download_request(self, request: Request, spider: Spider | None = None) -> Response:
         spider = spider or self._crawler.spider
 
-        if request.meta.get("playwright_fetch"):
-            return await self._download_request_with_fetch(request=request, spider=spider)
-
+        from scrapy.exceptions import IgnoreRequest
+        logger.debug(
+            "[Lifecycle] _download_request ENTER %s %s, _is_closing=%s, "
+            "context_wrappers=%s, has_browser=%s",
+            request.method, request.url, self._is_closing,
+            list(self.context_wrappers.keys()),
+            hasattr(self, "browser"),
+        )
         counter = 0
         while True:
-            try:
-                return await self._download_request_with_retry(request=request, spider=spider)
-            except TargetClosedError as ex:
-                counter += 1
-                if counter > self.config.target_closed_max_retries:
-                    raise ex
-                logger.debug(
-                    "Target closed, retrying to create page for %s",
-                    request,
-                    extra={
-                        "spider": spider,
-                        "scrapy_request_url": request.url,
-                        "scrapy_request_method": request.method,
-                        "exception": ex,
-                    },
+            if self._is_closing:
+                logger.info(
+                    "[Lifecycle] _download_request ABORT (is_closing) %s %s",
+                    request.method, request.url,
                 )
+                raise IgnoreRequest("Playwright handler is shutting down")
+            try:
+                if request.meta.get("playwright_fetch"):
+                    result = await self._download_request_with_fetch(request=request, spider=spider)
+                    logger.debug(
+                        "[Lifecycle] _download_request DONE (fetch) %s %s status=%s",
+                        request.method, request.url, result.status,
+                    )
+                    return result
+                result = await self._download_request_with_retry(request=request, spider=spider)
+                logger.debug(
+                    "[Lifecycle] _download_request DONE (page) %s %s status=%s",
+                    request.method, request.url, result.status,
+                )
+                return result
+            except Exception as ex:
+                ex_str = str(ex)
+                if "Connection closed while reading from the driver" in ex_str:
+                    if self._is_closing:
+                        logger.warning(
+                            "[Lifecycle] _download_request DRIVER_DEAD (shutting down) "
+                            "%s %s — exc_type=%s",
+                            request.method, request.url, type(ex).__name__,
+                        )
+                        raise IgnoreRequest("Playwright connection closed (shutting down)") from ex
+
+                    # Driver died but we're not shutting down — try to restart it
+                    self._driver_dead = True
+                    counter += 1
+                    logger.warning(
+                        "[Lifecycle] _download_request DRIVER_DEAD (will restart) "
+                        "%s %s — retry=%d/%d, exc_type=%s",
+                        request.method, request.url,
+                        counter, self.config.target_closed_max_retries,
+                        type(ex).__name__,
+                    )
+                    if counter > self.config.target_closed_max_retries:
+                        self._is_closing = True
+                        raise IgnoreRequest(
+                            "Playwright driver dead and max retries reached"
+                        ) from ex
+                    try:
+                        await self._restart_playwright()
+                        logger.info(
+                            "[Lifecycle] _download_request driver restarted, "
+                            "retrying %s %s",
+                            request.method, request.url,
+                        )
+                        continue
+                    except Exception as restart_ex:
+                        self._is_closing = True
+                        logger.error(
+                            "[Lifecycle] _download_request driver restart FAILED "
+                            "%s %s — exc_type=%s exc=%s",
+                            request.method, request.url,
+                            type(restart_ex).__name__, restart_ex,
+                        )
+                        raise IgnoreRequest(
+                            "Playwright driver restart failed"
+                        ) from restart_ex
+
+                if isinstance(ex, TargetClosedError) or _is_safe_close_error(ex):
+                    counter += 1
+                    logger.debug(
+                        "[Lifecycle] _download_request TARGET_CLOSED %s %s "
+                        "retry=%d/%d, _is_closing=%s, exc_type=%s, exc=%s",
+                        request.method, request.url,
+                        counter, self.config.target_closed_max_retries,
+                        self._is_closing, type(ex).__name__, ex,
+                    )
+                    if counter > self.config.target_closed_max_retries:
+                        raise TargetClosedError("Target closed and max retries reached") from ex
+                else:
+                    logger.warning(
+                        "[Lifecycle] _download_request UNHANDLED_EX %s %s "
+                        "exc_type=%s exc=%s",
+                        request.method, request.url, type(ex).__name__, ex,
+                    )
+                    raise
 
     def _should_close_page(self, request: Request) -> bool:
         return self.config.close_page_after_request and not request.meta.get(
@@ -523,12 +738,17 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         context_name = request.meta.get("playwright_fetch_context") or DEFAULT_CONTEXT_NAME
         request.meta.setdefault("playwright_context", context_name)
 
+        logger.debug("[Fetch] _get_or_create_fetch_page started for %s, context=%s", request, context_name)
         async with self.context_launch_lock:
             ctx_wrapper = self.context_wrappers.get(context_name)
             if ctx_wrapper is None:
+                logger.debug("[Fetch] ctx_wrapper is None, calling _create_browser_context")
                 ctx_wrapper = await self._create_browser_context(
                     name=context_name, context_kwargs=None, spider=spider,
                 )
+                logger.debug("[Fetch] _create_browser_context returned")
+            else:
+                logger.debug("[Fetch] ctx_wrapper found")
 
         # Try to reuse an existing, non-closed page
         for page in ctx_wrapper.context.pages:
@@ -536,11 +756,15 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                 return page
 
         # No usable page — create one and navigate to a seed URL
-        seed_url = (
-            request.meta.get("playwright_fetch_seed_url")
-            or _get_header_value(request.headers, b"Referer")
-            or _get_header_value(request.headers, b"Origin")
-        )
+        seed_url = request.meta.get("playwright_fetch_seed_url")
+        if not seed_url:
+            referer = request.headers.get("Referer")
+            if referer:
+                seed_url = referer.decode("utf-8")
+        if not seed_url:
+            origin = request.headers.get("Origin")
+            if origin:
+                seed_url = origin.decode("utf-8")
         if not seed_url:
             from urllib.parse import urlparse
             parsed = urlparse(request.url)
@@ -550,8 +774,11 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             "[Fetch] No open page in context '%s', creating one and seeding with %s",
             context_name, seed_url,
         )
+        logger.debug("[Fetch] Acquiring semaphore for new page in context '%s'", context_name)
         await ctx_wrapper.semaphore.acquire()
+        logger.debug("[Fetch] Semaphore acquired, creating new page")
         page = await ctx_wrapper.context.new_page()
+        logger.debug("[Fetch] New page created")
         self.stats.inc_value("playwright/page_count")
         self._set_max_concurrent_page_count()
         if self.config.navigation_timeout is not None:
@@ -564,7 +791,9 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         if ctx_wrapper.recorder:
             page.on("response", ctx_wrapper.recorder.on_response)
 
+        logger.debug("[Fetch] Going to seed URL: %s", seed_url)
         await page.goto(seed_url, wait_until="domcontentloaded")
+        logger.debug("[Fetch] Seed URL loaded")
         return page
 
     @staticmethod
@@ -595,9 +824,17 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         self, request: Request, spider: Spider,
     ) -> Response:
         """Execute the request as a fetch() call inside an open browser page."""
+        logger.debug(
+            "[Fetch] _download_request_with_fetch ENTER %s %s, _is_closing=%s",
+            request.method, request.url, self._is_closing,
+        )
         start_time = time()
 
         page = await self._get_or_create_fetch_page(request, spider)
+        logger.debug(
+            "[Fetch] _download_request_with_fetch got page, url=%s, closed=%s",
+            page.url, page.is_closed(),
+        )
 
         # Build header dict from Scrapy headers
         hdrs: dict = {}
@@ -653,7 +890,6 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         )
 
     # ── Navigation-style download (page.goto) ──────────────────────────
-
     async def _download_request_with_retry(self, request: Request, spider: Spider) -> Response:
         page = request.meta.get("playwright_page")
         if not isinstance(page, Page) or page.is_closed():
@@ -919,6 +1155,12 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         self.stats.inc_value(f"{stats_prefix}/method/{response.request.method}")
 
     async def _browser_disconnected_callback(self) -> None:
+        logger.info(
+            "[Lifecycle] _browser_disconnected_callback ENTER, _is_closing=%s, "
+            "context_wrappers=%s",
+            self._is_closing, list(self.context_wrappers.keys()),
+        )
+        self._driver_dead = True
         for ctx_wrapper in self.context_wrappers.values():
             if ctx_wrapper.recorder:
                 ctx_wrapper.recorder.finalize()
@@ -928,9 +1170,14 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         self.context_wrappers.clear()
         with suppress(TargetClosedError):
             await asyncio.gather(*close_context_coros)
-        logger.debug("Browser disconnected")
+        logger.debug(
+            "[Lifecycle] _browser_disconnected_callback contexts cleared, "
+            "restart_disconnected=%s",
+            self.config.restart_disconnected_browser,
+        )
         if self.config.restart_disconnected_browser:
             del self.browser
+        logger.info("[Lifecycle] _browser_disconnected_callback DONE, _driver_dead=True")
 
     def _make_close_page_callback(self, context_name: str) -> Callable:
         def close_page_callback() -> None:
