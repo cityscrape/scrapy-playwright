@@ -37,6 +37,7 @@ from scrapy.utils.misc import load_object
 from scrapy.utils.reactor import verify_installed_reactor
 from twisted.internet.defer import Deferred, inlineCallbacks
 
+from scrapy_playwright import signals as pw_signals
 from scrapy_playwright.headers import use_scrapy_headers
 from scrapy_playwright.network_recorder import NetworkRecorder
 from scrapy_playwright.page import PageMethod
@@ -74,6 +75,7 @@ class BrowserContextWrapper:
     semaphore: asyncio.Semaphore
     persistent: bool
     recorder: Optional[NetworkRecorder] = None
+    pool: Optional["PagePool"] = None
 
 
 @dataclass
@@ -87,6 +89,96 @@ class Download:
 
     def __bool__(self) -> bool:
         return bool(self.body) or bool(self.exception)
+
+
+# Pool strategies
+POOL_STRATEGY_REUSE_FIRST = "reuse_first"
+POOL_STRATEGY_CREATE_FIRST = "create_first"
+VALID_POOL_STRATEGIES = {POOL_STRATEGY_REUSE_FIRST, POOL_STRATEGY_CREATE_FIRST}
+
+
+class PagePool:
+    """Per-context async pool of reusable Playwright pages.
+
+    Pages returned to the pool are kept alive and can be re-acquired by
+    future requests instead of creating a brand-new page each time.
+    The pool shares the context's existing semaphore — a page sitting idle
+    in the pool still occupies a semaphore slot.
+
+    Strategies:
+      - ``reuse_first``: prefer recycling idle pages; only create new ones
+        when the idle queue is empty (default).
+      - ``create_first``: prefer creating new pages while semaphore capacity
+        remains; only recycle idle pages once the max is reached.
+    """
+
+    def __init__(
+        self, semaphore: asyncio.Semaphore, strategy: str = POOL_STRATEGY_REUSE_FIRST,
+    ) -> None:
+        self._idle: asyncio.Queue[Page] = asyncio.Queue()
+        self._semaphore = semaphore
+        self.strategy = strategy
+
+    @property
+    def idle_count(self) -> int:
+        return self._idle.qsize()
+
+    async def acquire(self, context: BrowserContext) -> Tuple[Page, bool]:
+        """Return an idle page or create a new one.
+
+        Returns ``(page, is_new)`` where *is_new* is ``False`` when the
+        page came from the idle pool (a "pool hit").
+        """
+        if self.strategy == POOL_STRATEGY_CREATE_FIRST:
+            return await self._acquire_create_first(context)
+        return await self._acquire_reuse_first(context)
+
+    async def _acquire_reuse_first(self, context: BrowserContext) -> Tuple[Page, bool]:
+        # Drain any dead pages that were externally closed
+        while not self._idle.empty():
+            page = self._idle.get_nowait()
+            if not page.is_closed():
+                return page, False
+            # Page died while idle — its close callback already released
+            # the semaphore, so we just discard it.
+
+        # No reusable page — create a fresh one (acquires semaphore)
+        await self._semaphore.acquire()
+        page = await context.new_page()
+        return page, True
+
+    async def _acquire_create_first(self, context: BrowserContext) -> Tuple[Page, bool]:
+        # Create a new page while semaphore has capacity (non-blocking check)
+        if not self._semaphore.locked():
+            await self._semaphore.acquire()
+            page = await context.new_page()
+            return page, True
+
+        # At max capacity — take an idle page instead
+        while not self._idle.empty():
+            page = self._idle.get_nowait()
+            if not page.is_closed():
+                return page, False
+
+        # No idle pages available — block until a slot opens
+        await self._semaphore.acquire()
+        page = await context.new_page()
+        return page, True
+
+    def release(self, page: Page) -> None:
+        """Return a page to the pool (or release the semaphore if dead)."""
+        if page.is_closed():
+            # Already closed — semaphore was released by the close callback.
+            return
+        self._idle.put_nowait(page)
+
+    async def drain(self) -> None:
+        """Close all idle pages (for shutdown)."""
+        while not self._idle.empty():
+            page = self._idle.get_nowait()
+            if not page.is_closed():
+                with suppress(Exception):
+                    await page.close()
 
 
 @dataclass
@@ -103,6 +195,8 @@ class Config:
     navigation_timeout: Optional[float]
     restart_disconnected_browser: bool
     close_page_after_request: bool
+    page_pooling: bool = False
+    page_pool_strategy: str = POOL_STRATEGY_REUSE_FIRST
     target_closed_max_retries: int = 3
     use_threaded_loop: bool = False
     har_recording: bool = False
@@ -134,10 +228,17 @@ class Config:
             close_page_after_request=settings.getbool(
                 "PLAYWRIGHT_CLOSE_PAGE_AFTER_REQUEST", default=False
             ),
+            page_pooling=settings.getbool("PLAYWRIGHT_PAGE_POOLING", default=False),
+            page_pool_strategy=settings.get(
+                "PLAYWRIGHT_PAGE_POOL_STRATEGY", POOL_STRATEGY_REUSE_FIRST
+            ),
             use_threaded_loop=platform.system() == "Windows"
             or settings.getbool("_PLAYWRIGHT_THREADED_LOOP", False),
             har_recording=settings.getbool("PLAYWRIGHT_HAR_RECORDING", default=False),
-            har_output_dir=settings.get("PLAYWRIGHT_HAR_OUTPUT_DIR", "debug/har_recordings"),
+            har_output_dir=settings.get(
+                "PLAYWRIGHT_HAR_OUTPUT_DIR",
+                os.path.join(settings.get("OUTPUT_DIRECTORY", "output"), "har_recordings"),
+            ),
             har_url_filter=settings.get("PLAYWRIGHT_HAR_URL_FILTER"),
         )
         cfg.cdp_kwargs.pop("endpoint_url", None)
@@ -146,6 +247,11 @@ class Config:
             cfg.max_pages_per_context = settings.getint("CONCURRENT_REQUESTS")
         if (cfg.cdp_url or cfg.connect_url) and cfg.launch_options:
             logger.warning("Connecting to remote browser, ignoring PLAYWRIGHT_LAUNCH_OPTIONS")
+        if cfg.page_pool_strategy not in VALID_POOL_STRATEGIES:
+            raise NotSupported(
+                f"Invalid PLAYWRIGHT_PAGE_POOL_STRATEGY: {cfg.page_pool_strategy!r}. "
+                f"Valid values: {', '.join(sorted(VALID_POOL_STRATEGIES))}"
+            )
         return cfg
 
 
@@ -247,6 +353,10 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             self._set_max_concurrent_context_count()
             logger.info("Startup context(s) launched")
             self.stats.set_value("playwright/page_count", self._get_total_page_count())
+        self._crawler.signals.send_catch_log(
+            pw_signals.handler_ready,
+            browser_type=self.config.browser_type_name,
+        )
 
     async def _restart_playwright(self) -> None:
         """Restart the Playwright driver (Node.js subprocess) after it has died.
@@ -286,6 +396,10 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             self.browser_type = getattr(self.playwright, self.config.browser_type_name)
             self._driver_dead = False
             self.stats.inc_value("playwright/driver_restart_count")
+            self._crawler.signals.send_catch_log(
+                pw_signals.driver_restarted,
+                browser_type=self.browser_type.name,
+            )
 
             logger.info(
                 "[Lifecycle] _restart_playwright DONE, new driver ready, "
@@ -445,13 +559,26 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             )
             if self.config.navigation_timeout is not None:
                 context.set_default_navigation_timeout(self.config.navigation_timeout)
+            semaphore = asyncio.Semaphore(value=self.config.max_pages_per_context)
+            pool = (
+                PagePool(semaphore, strategy=self.config.page_pool_strategy)
+                if self.config.page_pooling
+                else None
+            )
             self.context_wrappers[name] = BrowserContextWrapper(
                 context=context,
-                semaphore=asyncio.Semaphore(value=self.config.max_pages_per_context),
+                semaphore=semaphore,
                 persistent=persistent,
                 recorder=recorder,
+                pool=pool,
             )
             self._set_max_concurrent_context_count()
+            self._crawler.signals.send_catch_log(
+                pw_signals.context_created,
+                context_name=name,
+                persistent=persistent,
+                remote=remote,
+            )
             return self.context_wrappers[name]
         except Exception:
             if hasattr(self, "context_semaphore"):
@@ -477,13 +604,24 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                     spider=spider,
                 )
 
-        await ctx_wrapper.semaphore.acquire()
-        page = await ctx_wrapper.context.new_page()
-        self.stats.inc_value("playwright/page_count")
+        if ctx_wrapper.pool is not None:
+            page, is_new = await ctx_wrapper.pool.acquire(ctx_wrapper.context)
+            if is_new:
+                self.stats.inc_value("playwright/page_count")
+                self.stats.inc_value("playwright/page_count/pool_miss")
+            else:
+                self.stats.inc_value("playwright/page_count/pool_hit")
+        else:
+            await ctx_wrapper.semaphore.acquire()
+            page = await ctx_wrapper.context.new_page()
+            is_new = True
+            self.stats.inc_value("playwright/page_count")
+
         total_page_count = self._get_total_page_count()
         logger.debug(
-            "[Context=%s] New page created, page count is %i (%i for all contexts)",
+            "[Context=%s] Page %s, page count is %i (%i for all contexts)",
             context_name,
+            "created" if is_new else "recycled from pool",
             len(ctx_wrapper.context.pages),
             total_page_count,
             extra={
@@ -499,15 +637,23 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         if self.config.navigation_timeout is not None:
             page.set_default_navigation_timeout(self.config.navigation_timeout)
 
-        page.on("close", self._make_close_page_callback(context_name))
-        page.on("crash", self._make_close_page_callback(context_name))
-        page.on("request", self._increment_request_stats)
-        page.on("response", self._increment_response_stats)
-        if ctx_wrapper.recorder:
-            page.on("response", ctx_wrapper.recorder.on_response)
-        if logger.getEffectiveLevel() <= logging.DEBUG:
-            page.on("request", _make_request_logger(context_name, spider))
-            page.on("response", _make_response_logger(context_name, spider))
+        if is_new:
+            page.on("close", self._make_close_page_callback(context_name))
+            page.on("crash", self._make_close_page_callback(context_name))
+            page.on("request", self._increment_request_stats)
+            page.on("response", self._increment_response_stats)
+            if ctx_wrapper.recorder:
+                page.on("response", ctx_wrapper.recorder.on_response)
+            if logger.getEffectiveLevel() <= logging.DEBUG:
+                page.on("request", _make_request_logger(context_name, spider))
+                page.on("response", _make_response_logger(context_name, spider))
+
+        self._crawler.signals.send_catch_log(
+            pw_signals.page_created,
+            context_name=context_name,
+            context_page_count=len(ctx_wrapper.context.pages),
+            total_page_count=total_page_count,
+        )
 
         return page
 
@@ -562,6 +708,11 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             hasattr(self, "browser"),
         )
         self._is_closing = True
+        self._crawler.signals.send_catch_log(
+            pw_signals.handler_closing,
+            context_count=len(self.context_wrappers),
+            page_count=self._get_total_page_count(),
+        )
         for ctx in self.context_wrappers.values():
             if ctx.recorder:
                 ctx.recorder.finalize()
@@ -570,6 +721,10 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                 )
         ctx_names = list(self.context_wrappers.keys())
         logger.debug("[Lifecycle] _close() closing %d contexts: %s", len(ctx_names), ctx_names)
+        # Drain page pools before closing contexts
+        for ctx in self.context_wrappers.values():
+            if ctx.pool is not None:
+                await ctx.pool.drain()
         with suppress(TargetClosedError):
             await asyncio.gather(*[ctx.context.close() for ctx in self.context_wrappers.values()])
         self.context_wrappers.clear()
@@ -634,6 +789,14 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             list(self.context_wrappers.keys()),
             hasattr(self, "browser"),
         )
+        download_mode = "fetch" if request.meta.get("playwright_fetch") else "page"
+        download_start_time = time()
+        self._crawler.signals.send_catch_log(
+            pw_signals.download_started,
+            url=request.url,
+            method=request.method,
+            mode=download_mode,
+        )
         counter = 0
         while True:
             if self._is_closing:
@@ -649,11 +812,27 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                         "[Lifecycle] _download_request DONE (fetch) %s %s status=%s",
                         request.method, request.url, result.status,
                     )
+                    self._crawler.signals.send_catch_log(
+                        pw_signals.download_completed,
+                        url=request.url,
+                        method=request.method,
+                        mode=download_mode,
+                        status=result.status,
+                        duration=time() - download_start_time,
+                    )
                     return result
                 result = await self._download_request_with_retry(request=request, spider=spider)
                 logger.debug(
                     "[Lifecycle] _download_request DONE (page) %s %s status=%s",
                     request.method, request.url, result.status,
+                )
+                self._crawler.signals.send_catch_log(
+                    pw_signals.download_completed,
+                    url=request.url,
+                    method=request.method,
+                    mode=download_mode,
+                    status=result.status,
+                    duration=time() - download_start_time,
                 )
                 return result
             except Exception as ex:
@@ -679,6 +858,14 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                     )
                     if counter > self.config.target_closed_max_retries:
                         self._is_closing = True
+                        self._crawler.signals.send_catch_log(
+                            pw_signals.download_failed,
+                            url=request.url,
+                            method=request.method,
+                            mode=download_mode,
+                            error_type=type(ex).__name__,
+                            duration=time() - download_start_time,
+                        )
                         raise IgnoreRequest(
                             "Playwright driver dead and max retries reached"
                         ) from ex
@@ -712,6 +899,14 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                         self._is_closing, type(ex).__name__, ex,
                     )
                     if counter > self.config.target_closed_max_retries:
+                        self._crawler.signals.send_catch_log(
+                            pw_signals.download_failed,
+                            url=request.url,
+                            method=request.method,
+                            mode=download_mode,
+                            error_type=type(ex).__name__,
+                            duration=time() - download_start_time,
+                        )
                         raise TargetClosedError("Target closed and max retries reached") from ex
                 else:
                     logger.warning(
@@ -719,12 +914,32 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                         "exc_type=%s exc=%s",
                         request.method, request.url, type(ex).__name__, ex,
                     )
+                    self._crawler.signals.send_catch_log(
+                        pw_signals.download_failed,
+                        url=request.url,
+                        method=request.method,
+                        mode=download_mode,
+                        error_type=type(ex).__name__,
+                        duration=time() - download_start_time,
+                    )
                     raise
 
     def _should_close_page(self, request: Request) -> bool:
         return self.config.close_page_after_request and not request.meta.get(
             "playwright_include_page"
         )
+
+    async def _return_or_close_page(self, request: Request, page: Page) -> None:
+        """Return a page to the pool if pooling is enabled, otherwise close it."""
+        context_name = request.meta.get("playwright_context", DEFAULT_CONTEXT_NAME)
+        ctx_wrapper = self.context_wrappers.get(context_name)
+        if ctx_wrapper and ctx_wrapper.pool is not None and not page.is_closed():
+            ctx_wrapper.pool.release(page)
+            self.stats.inc_value("playwright/page_count/returned_to_pool")
+        else:
+            if not page.is_closed():
+                await page.close()
+            self.stats.inc_value("playwright/page_count/closed")
 
     # ── Fetch-style download (page.evaluate + fetch) ───────────────────
 
@@ -774,22 +989,28 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             "[Fetch] No open page in context '%s', creating one and seeding with %s",
             context_name, seed_url,
         )
-        logger.debug("[Fetch] Acquiring semaphore for new page in context '%s'", context_name)
-        await ctx_wrapper.semaphore.acquire()
-        logger.debug("[Fetch] Semaphore acquired, creating new page")
-        page = await ctx_wrapper.context.new_page()
-        logger.debug("[Fetch] New page created")
+        if ctx_wrapper.pool is not None:
+            page, is_new = await ctx_wrapper.pool.acquire(ctx_wrapper.context)
+        else:
+            logger.debug("[Fetch] Acquiring semaphore for new page in context '%s'", context_name)
+            await ctx_wrapper.semaphore.acquire()
+            logger.debug("[Fetch] Semaphore acquired, creating new page")
+            page = await ctx_wrapper.context.new_page()
+            is_new = True
+
+        logger.debug("[Fetch] Page %s", "created" if is_new else "recycled from pool")
         self.stats.inc_value("playwright/page_count")
         self._set_max_concurrent_page_count()
         if self.config.navigation_timeout is not None:
             page.set_default_navigation_timeout(self.config.navigation_timeout)
 
-        page.on("close", self._make_close_page_callback(context_name))
-        page.on("crash", self._make_close_page_callback(context_name))
-        page.on("request", self._increment_request_stats)
-        page.on("response", self._increment_response_stats)
-        if ctx_wrapper.recorder:
-            page.on("response", ctx_wrapper.recorder.on_response)
+        if is_new:
+            page.on("close", self._make_close_page_callback(context_name))
+            page.on("crash", self._make_close_page_callback(context_name))
+            page.on("request", self._increment_request_stats)
+            page.on("response", self._increment_response_stats)
+            if ctx_wrapper.recorder:
+                page.on("response", ctx_wrapper.recorder.on_response)
 
         logger.debug("[Fetch] Going to seed URL: %s", seed_url)
         await page.goto(seed_url, wait_until="domcontentloaded")
@@ -862,6 +1083,14 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         )
 
         result = await page.evaluate(js_code)
+
+        self._crawler.signals.send_catch_log(
+            pw_signals.fetch_executed,
+            url=request.url,
+            method=request.method,
+            status=result["status"],
+            duration=time() - start_time,
+        )
 
         status = result["status"]
         resp_headers = Headers(result.get("headers") or {})
@@ -944,8 +1173,7 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                     },
                     exc_info=True,
                 )
-                await page.close()
-                self.stats.inc_value("playwright/page_count/closed")
+                await self._return_or_close_page(request, page)
             raise
 
     async def _download_request_with_page(
@@ -996,8 +1224,7 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             raise download.exception
 
         if self._should_close_page(request):
-            await page.close()
-            self.stats.inc_value("playwright/page_count/closed")
+            await self._return_or_close_page(request, page)
 
         if download:
             request.meta["playwright_suggested_filename"] = download.suggested_filename
@@ -1161,6 +1388,10 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             self._is_closing, list(self.context_wrappers.keys()),
         )
         self._driver_dead = True
+        self._crawler.signals.send_catch_log(
+            pw_signals.browser_disconnected,
+            restart_enabled=self.config.restart_disconnected_browser,
+        )
         for ctx_wrapper in self.context_wrappers.values():
             if ctx_wrapper.recorder:
                 ctx_wrapper.recorder.finalize()

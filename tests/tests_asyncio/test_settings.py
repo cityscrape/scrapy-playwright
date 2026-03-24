@@ -50,3 +50,32 @@ class TestSettings(IsolatedAsyncioTestCase):
 
         async with make_handler({"PLAYWRIGHT_MAX_CONTEXTS": 1234}) as handler:
             assert handler.context_semaphore._value == 1234
+
+    async def test_page_pooling(self):
+        config = Config.from_settings(Settings({}))
+        assert config.page_pooling is False
+
+        config = Config.from_settings(Settings({"PLAYWRIGHT_PAGE_POOLING": True}))
+        assert config.page_pooling is True
+
+        config = Config.from_settings(Settings({"PLAYWRIGHT_PAGE_POOLING": False}))
+        assert config.page_pooling is False
+
+    async def test_page_pool_strategy(self):
+        config = Config.from_settings(Settings({}))
+        assert config.page_pool_strategy == "reuse_first"
+
+        config = Config.from_settings(
+            Settings({"PLAYWRIGHT_PAGE_POOL_STRATEGY": "create_first"})
+        )
+        assert config.page_pool_strategy == "create_first"
+
+        config = Config.from_settings(
+            Settings({"PLAYWRIGHT_PAGE_POOL_STRATEGY": "reuse_first"})
+        )
+        assert config.page_pool_strategy == "reuse_first"
+
+        with pytest.raises(NotSupported, match="Invalid PLAYWRIGHT_PAGE_POOL_STRATEGY"):
+            Config.from_settings(
+                Settings({"PLAYWRIGHT_PAGE_POOL_STRATEGY": "invalid_strategy"})
+            )
