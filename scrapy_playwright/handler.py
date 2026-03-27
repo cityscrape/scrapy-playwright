@@ -134,34 +134,89 @@ class PagePool:
         return await self._acquire_reuse_first(context)
 
     async def _acquire_reuse_first(self, context: BrowserContext) -> Tuple[Page, bool]:
+        _sem_val = self._semaphore._value
+        _idle_sz = self._idle.qsize()
+        _discarded = 0
         # Drain any dead pages that were externally closed
         while not self._idle.empty():
             page = self._idle.get_nowait()
             if not page.is_closed():
+                logger.debug(
+                    "[PagePool:%s] ACQUIRE reuse_first → REUSED idle page "
+                    "(idle_before=%d, idle_after=%d, sem_value=%d, discarded_dead=%d)",
+                    self.strategy, _idle_sz, self._idle.qsize(),
+                    self._semaphore._value, _discarded,
+                )
                 return page, False
             # Page died while idle — its close callback already released
             # the semaphore, so we just discard it.
+            _discarded += 1
 
         # No reusable page — create a fresh one (acquires semaphore)
+        logger.debug(
+            "[PagePool:%s] ACQUIRE reuse_first → no idle pages, WAITING for semaphore "
+            "(idle_before=%d, sem_value=%d, sem_locked=%s, discarded_dead=%d)",
+            self.strategy, _idle_sz, self._semaphore._value,
+            self._semaphore.locked(), _discarded,
+        )
         await self._semaphore.acquire()
+        logger.debug(
+            "[PagePool:%s] ACQUIRE reuse_first → semaphore ACQUIRED, creating new page "
+            "(sem_value=%d)",
+            self.strategy, self._semaphore._value,
+        )
         page = await context.new_page()
         return page, True
 
     async def _acquire_create_first(self, context: BrowserContext) -> Tuple[Page, bool]:
+        _sem_val = self._semaphore._value
+        _idle_sz = self._idle.qsize()
+        _sem_locked = self._semaphore.locked()
+
         # Create a new page while semaphore has capacity (non-blocking check)
-        if not self._semaphore.locked():
+        if not _sem_locked:
             await self._semaphore.acquire()
             page = await context.new_page()
+            logger.debug(
+                "[PagePool:%s] ACQUIRE create_first → CREATED new page "
+                "(sem_was=%d, sem_now=%d, idle_available=%d)",
+                self.strategy, _sem_val, self._semaphore._value, _idle_sz,
+            )
             return page, True
 
         # At max capacity — take an idle page instead
+        _discarded = 0
         while not self._idle.empty():
             page = self._idle.get_nowait()
             if not page.is_closed():
+                logger.debug(
+                    "[PagePool:%s] ACQUIRE create_first → sem full, REUSED idle page "
+                    "(sem_value=%d, idle_before=%d, idle_after=%d, discarded_dead=%d)",
+                    self.strategy, self._semaphore._value, _idle_sz,
+                    self._idle.qsize(), _discarded,
+                )
                 return page, False
+            _discarded += 1
 
         # No idle pages available — block until a slot opens
+        # ⚠ THIS IS THE SUSPECTED DEADLOCK POINT: if all semaphore slots
+        # are held by pages that were returned to the pool (pool.release
+        # does NOT release the semaphore), we will wait here forever.
+        logger.warning(
+            "[PagePool:%s] ACQUIRE create_first → sem full AND idle empty, "
+            "BLOCKING on semaphore.acquire() — POTENTIAL DEADLOCK "
+            "(sem_value=%d, sem_locked=%s, idle_before=%d, idle_after=%d, "
+            "discarded_dead=%d, context_pages=%d)",
+            self.strategy, self._semaphore._value, self._semaphore.locked(),
+            _idle_sz, self._idle.qsize(), _discarded,
+            len(context.pages),
+        )
         await self._semaphore.acquire()
+        logger.debug(
+            "[PagePool:%s] ACQUIRE create_first → semaphore UNBLOCKED after wait, "
+            "creating new page (sem_value=%d, idle=%d)",
+            self.strategy, self._semaphore._value, self._idle.qsize(),
+        )
         page = await context.new_page()
         return page, True
 
@@ -169,16 +224,34 @@ class PagePool:
         """Return a page to the pool (or release the semaphore if dead)."""
         if page.is_closed():
             # Already closed — semaphore was released by the close callback.
+            logger.debug(
+                "[PagePool:%s] RELEASE → page already closed, skipping "
+                "(sem_value=%d, idle=%d)",
+                self.strategy, self._semaphore._value, self._idle.qsize(),
+            )
             return
         self._idle.put_nowait(page)
+        logger.debug(
+            "[PagePool:%s] RELEASE → page returned to idle queue "
+            "(sem_value=%d, idle_after=%d, sem_locked=%s)",
+            self.strategy, self._semaphore._value, self._idle.qsize(),
+            self._semaphore.locked(),
+        )
 
     async def drain(self) -> None:
         """Close all idle pages (for shutdown)."""
+        _count = self._idle.qsize()
+        _closed = 0
         while not self._idle.empty():
             page = self._idle.get_nowait()
             if not page.is_closed():
                 with suppress(Exception):
                     await page.close()
+                _closed += 1
+        logger.debug(
+            "[PagePool:%s] DRAIN → closed %d/%d idle pages (sem_value=%d)",
+            self.strategy, _closed, _count, self._semaphore._value,
+        )
 
 
 @dataclass
@@ -605,6 +678,15 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                 )
 
         if ctx_wrapper.pool is not None:
+            logger.debug(
+                "[Context=%s] _create_page → pool.acquire() ENTER "
+                "(pool_strategy=%s, sem_value=%d, sem_locked=%s, idle=%d, "
+                "context_pages=%d, url=%s)",
+                context_name, ctx_wrapper.pool.strategy,
+                ctx_wrapper.semaphore._value, ctx_wrapper.semaphore.locked(),
+                ctx_wrapper.pool.idle_count, len(ctx_wrapper.context.pages),
+                request.url,
+            )
             page, is_new = await ctx_wrapper.pool.acquire(ctx_wrapper.context)
             if is_new:
                 self.stats.inc_value("playwright/page_count")
@@ -619,11 +701,15 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
 
         total_page_count = self._get_total_page_count()
         logger.debug(
-            "[Context=%s] Page %s, page count is %i (%i for all contexts)",
+            "[Context=%s] _create_page → Page %s, page count is %i (%i for all contexts), "
+            "sem_value=%d, idle=%d, url=%s",
             context_name,
-            "created" if is_new else "recycled from pool",
+            "CREATED (pool miss)" if is_new else "RECYCLED (pool hit)",
             len(ctx_wrapper.context.pages),
             total_page_count,
+            ctx_wrapper.semaphore._value,
+            ctx_wrapper.pool.idle_count if ctx_wrapper.pool else -1,
+            request.url,
             extra={
                 "spider": spider,
                 "context_name": context_name,
@@ -933,11 +1019,29 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         """Return a page to the pool if pooling is enabled, otherwise close it."""
         context_name = request.meta.get("playwright_context", DEFAULT_CONTEXT_NAME)
         ctx_wrapper = self.context_wrappers.get(context_name)
-        if ctx_wrapper and ctx_wrapper.pool is not None and not page.is_closed():
+        _page_closed = page.is_closed()
+        _has_pool = ctx_wrapper is not None and ctx_wrapper.pool is not None
+        if _has_pool and not _page_closed:
+            logger.debug(
+                "[Context=%s] _return_or_close_page → RETURNING to pool "
+                "(page_closed=%s, sem_value=%d, sem_locked=%s, idle_before=%d, "
+                "context_pages=%d, url=%s)",
+                context_name, _page_closed,
+                ctx_wrapper.semaphore._value, ctx_wrapper.semaphore.locked(),
+                ctx_wrapper.pool.idle_count, len(ctx_wrapper.context.pages),
+                request.url,
+            )
             ctx_wrapper.pool.release(page)
             self.stats.inc_value("playwright/page_count/returned_to_pool")
         else:
-            if not page.is_closed():
+            logger.debug(
+                "[Context=%s] _return_or_close_page → CLOSING page "
+                "(has_pool=%s, page_closed=%s, sem_value=%s, url=%s)",
+                context_name, _has_pool, _page_closed,
+                ctx_wrapper.semaphore._value if ctx_wrapper else "N/A",
+                request.url,
+            )
+            if not _page_closed:
                 await page.close()
             self.stats.inc_value("playwright/page_count/closed")
 
@@ -1158,21 +1262,31 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         try:
             return await self._download_request_with_page(request, page, spider)
         except Exception as ex:
-            if self._should_close_page(request) and not page.is_closed():
-                logger.warning(
-                    "Closing page due to failed request: %s exc_type=%s exc_msg=%s",
-                    request,
-                    type(ex),
-                    str(ex),
-                    extra={
-                        "spider": spider,
-                        "context_name": context_name,
-                        "scrapy_request_url": request.url,
-                        "scrapy_request_method": request.method,
-                        "exception": ex,
-                    },
-                    exc_info=True,
-                )
+            _ctx_w = self.context_wrappers.get(context_name)
+            _should_close = self._should_close_page(request)
+            _page_closed = page.is_closed()
+            logger.warning(
+                "[Context=%s] _download_request_with_retry EXCEPTION "
+                "exc_type=%s exc_msg=%s should_close=%s page_closed=%s "
+                "sem_value=%s sem_locked=%s pool_idle=%s context_pages=%s "
+                "url=%s",
+                context_name, type(ex).__name__, str(ex)[:200],
+                _should_close, _page_closed,
+                _ctx_w.semaphore._value if _ctx_w else "N/A",
+                _ctx_w.semaphore.locked() if _ctx_w else "N/A",
+                _ctx_w.pool.idle_count if _ctx_w and _ctx_w.pool else "N/A",
+                len(_ctx_w.context.pages) if _ctx_w else "N/A",
+                request.url,
+                extra={
+                    "spider": spider,
+                    "context_name": context_name,
+                    "scrapy_request_url": request.url,
+                    "scrapy_request_method": request.method,
+                    "exception": ex,
+                },
+                exc_info=True,
+            )
+            if _should_close and not _page_closed:
                 await self._return_or_close_page(request, page)
             raise
 
@@ -1225,6 +1339,20 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
 
         if self._should_close_page(request):
             await self._return_or_close_page(request, page)
+        else:
+            _ctx_name = request.meta.get("playwright_context", DEFAULT_CONTEXT_NAME)
+            _ctx_w = self.context_wrappers.get(_ctx_name)
+            logger.debug(
+                "[Context=%s] _download_request_with_page SUCCESS \u2192 page kept alive "
+                "(should_close=False, include_page=%s, sem_value=%s, pool_idle=%s, "
+                "context_pages=%s, url=%s)",
+                _ctx_name,
+                request.meta.get("playwright_include_page"),
+                _ctx_w.semaphore._value if _ctx_w else "N/A",
+                _ctx_w.pool.idle_count if _ctx_w and _ctx_w.pool else "N/A",
+                len(_ctx_w.context.pages) if _ctx_w else "N/A",
+                request.url,
+            )
 
         if download:
             request.meta["playwright_suggested_filename"] = download.suggested_filename
@@ -1413,7 +1541,22 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
     def _make_close_page_callback(self, context_name: str) -> Callable:
         def close_page_callback() -> None:
             if context_name in self.context_wrappers:
-                self.context_wrappers[context_name].semaphore.release()
+                _ctx = self.context_wrappers[context_name]
+                _sem_before = _ctx.semaphore._value
+                _ctx.semaphore.release()
+                _pool_idle = _ctx.pool.idle_count if _ctx.pool else -1
+                logger.debug(
+                    "[Context=%s] close_page_callback → semaphore RELEASED "
+                    "(sem_before=%d, sem_after=%d, pool_idle=%d, context_pages=%d)",
+                    context_name, _sem_before, _ctx.semaphore._value,
+                    _pool_idle, len(_ctx.context.pages),
+                )
+            else:
+                logger.debug(
+                    "[Context=%s] close_page_callback → context already removed, "
+                    "skipping semaphore release",
+                    context_name,
+                )
 
         return close_page_callback
 
