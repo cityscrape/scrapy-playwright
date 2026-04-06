@@ -11,6 +11,7 @@ import base64
 import json
 import logging
 import os
+import pathlib
 import re
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -22,7 +23,6 @@ from playwright.async_api import (
     Request as PlaywrightRequest,
     Response as PlaywrightResponse,
 )
-
 
 logger = logging.getLogger("scrapy-playwright")
 
@@ -343,14 +343,14 @@ class NetworkRecorder:
     """
 
     def __init__(
-        self,
-        output_dir: str,
-        context_name: str,
-        url_filter: Optional[str] = None,
+            self,
+            output_dir: pathlib.Path,
+            context_name: str,
+            url_filter: Optional[str] = None,
     ) -> None:
         safe_name = re.sub(r"[^\w\-]", "_", context_name)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        self.base_dir = os.path.join(output_dir, f"{safe_name}_{timestamp}")
+        self.base_dir = output_dir / f"{safe_name}_{timestamp}"
         os.makedirs(self.base_dir, exist_ok=True)
         self.context_name = context_name
         self._url_filter = re.compile(url_filter) if url_filter else None
@@ -383,7 +383,7 @@ class NetworkRecorder:
     # ── Build HAR-format entry from Playwright objects ─────────────────
 
     async def _build_har_entry(
-        self, response: PlaywrightResponse,
+            self, response: PlaywrightResponse,
     ) -> dict:
         pw_request = response.request
 
@@ -438,11 +438,11 @@ class NetworkRecorder:
             # Store as base64 for binary, text for text
             base_mime = resp_mime.split(';')[0].strip().lower()
             is_text = (
-                base_mime.startswith('text/')
-                or 'json' in base_mime
-                or 'xml' in base_mime
-                or 'javascript' in base_mime
-                or 'x-www-form-urlencoded' in base_mime
+                    base_mime.startswith('text/')
+                    or 'json' in base_mime
+                    or 'xml' in base_mime
+                    or 'javascript' in base_mime
+                    or 'x-www-form-urlencoded' in base_mime
             )
             if is_text:
                 try:
