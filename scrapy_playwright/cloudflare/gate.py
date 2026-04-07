@@ -7,9 +7,10 @@ can coexist with an active Cloudflare challenge.
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from scrapy_playwright.cloudflare.types import ChallengeType, classify_challenge
+from scrapy_playwright import signals as pw_signals
 
 if TYPE_CHECKING:
     from scrapy.http import Response
@@ -26,12 +27,23 @@ class CfGate:
     after the response is no longer classified as a Cloudflare challenge.
     """
 
-    def __init__(self, enabled: bool) -> None:
+    def __init__(self, enabled: bool, emit_signal: Optional[Callable] = None) -> None:
         self._event = asyncio.Event()
         self._serial_lock = asyncio.Lock()
+        self._emit_signal = emit_signal
         if not enabled:
             # Gate starts open when CF retry is disabled.
             self._event.set()
+
+    @staticmethod
+    def _header_to_str(value) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, list):
+            value = value[0] if value else None
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
 
     @property
     def is_open(self) -> bool:
@@ -41,11 +53,13 @@ class CfGate:
     def serial_lock(self) -> asyncio.Lock:
         return self._serial_lock
 
-    def open(self) -> None:
+    def open(self, **event_attrs) -> None:
         logger.info("[CfGate] clearance validated — allowing parallel requests")
         self._event.set()
+        if self._emit_signal is not None:
+            self._emit_signal(pw_signals.cloudflare_gate_opened, **event_attrs)
 
-    async def maybe_open(self, response: Optional["Response"]) -> None:
+    async def maybe_open(self, response: Optional["Response"], **event_attrs) -> None:
         """Open the gate if *response* is no longer challenged by Cloudflare."""
         if self._event.is_set():
             return
@@ -54,7 +68,12 @@ class CfGate:
 
         challenge_type = classify_challenge(response)
         if challenge_type == ChallengeType.NONE:
-            self.open()
+            self.open(
+                **event_attrs,
+                challenge_type=challenge_type.value,
+                status=response.status,
+                resp_url=response.url,
+            )
             return
 
         logger.info(
@@ -63,3 +82,12 @@ class CfGate:
             response.status,
             response.url,
         )
+        if self._emit_signal is not None:
+            self._emit_signal(
+                pw_signals.cloudflare_gate_blocked,
+                **event_attrs,
+                challenge_type=challenge_type.value,
+                status=response.status,
+                resp_url=response.url,
+                cf_mitigated=self._header_to_str(response.headers.get(b"Cf-Mitigated")),
+            )

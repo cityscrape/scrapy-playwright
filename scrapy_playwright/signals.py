@@ -119,3 +119,169 @@ driver_restarted = object()
 Keyword arguments:
 * ``browser_type`` — name of the browser (e.g. ``"chromium"``).
 """
+
+# ── Anti-bot / Cloudflare lifecycle ──────────────────────────────────
+
+cloudflare_gate_blocked = object()
+"""Fired when the pre-clearance gate remains closed after a challenged response.
+
+Keyword arguments:
+* ``url``            — request URL.
+* ``method``         — HTTP method.
+* ``mode``           — ``"page"`` or ``"fetch"``.
+* ``context_name``   — logical name of the context.
+* ``challenge_type`` — challenge classification.
+* ``status``         — response status code.
+* ``resp_url``       — final response URL.
+* ``cf_mitigated``   — ``Cf-Mitigated`` response header if present.
+"""
+
+cloudflare_gate_opened = object()
+"""Fired when the pre-clearance gate opens after an unchallenged response.
+
+Keyword arguments:
+* ``url``            — request URL.
+* ``method``         — HTTP method.
+* ``mode``           — ``"page"`` or ``"fetch"``.
+* ``context_name``   — logical name of the context.
+* ``challenge_type`` — classification of the final response (normally ``"none"``).
+* ``status``         — response status code.
+* ``resp_url``       — final response URL.
+"""
+
+cloudflare_challenge_detected = object()
+"""Fired when a challenged response is classified as Cloudflare-managed.
+
+Keyword arguments:
+* ``request``        — originating Scrapy request.
+* ``url``            — request URL.
+* ``method``         — HTTP method.
+* ``mode``           — ``"page"`` or ``"fetch"``.
+* ``context_name``   — logical name of the context.
+* ``challenge_type`` — challenge classification.
+* ``status``         — response status code.
+* ``resp_url``       — final response URL.
+* ``cf_mitigated``   — ``Cf-Mitigated`` response header if present.
+"""
+
+cloudflare_request_parked = object()
+"""Fired when a request waits behind an active solve cycle.
+
+Keyword arguments:
+* ``request``      — parked Scrapy request.
+* ``url``          — request URL.
+* ``method``       — HTTP method.
+* ``mode``         — ``"page"`` or ``"fetch"``.
+* ``context_name`` — logical name of the context.
+* ``duration``     — parked time in seconds.
+"""
+
+cloudflare_solve_started = object()
+"""Fired when a request becomes the solver for a context challenge cycle.
+
+Keyword arguments:
+* ``request``        — originating Scrapy request.
+* ``url``            — request URL.
+* ``method``         — HTTP method.
+* ``mode``           — ``"page"`` or ``"fetch"``.
+* ``context_name``   — logical name of the context.
+* ``challenge_type`` — challenge classification.
+* ``attempt_count``  — solve attempt number.
+"""
+
+cloudflare_solve_completed = object()
+"""Fired when a solve cycle completes successfully.
+
+Keyword arguments:
+* ``request``           — originating Scrapy request.
+* ``url``               — request URL.
+* ``method``            — HTTP method.
+* ``mode``              — ``"page"`` or ``"fetch"``.
+* ``context_name``      — logical name of the context.
+* ``challenge_type``    — challenge classification.
+* ``attempt_count``     — solve attempt number.
+* ``duration``          — solve duration in seconds.
+* ``validated_url``     — URL used to validate clearance.
+* ``outcome``           — terminal outcome string.
+"""
+
+cloudflare_solve_failed = object()
+"""Fired when a solve cycle fails or errors.
+
+Keyword arguments:
+* ``request``         — originating Scrapy request.
+* ``url``             — request URL.
+* ``method``          — HTTP method.
+* ``mode``            — ``"page"`` or ``"fetch"``.
+* ``context_name``    — logical name of the context.
+* ``challenge_type``  — challenge classification.
+* ``attempt_count``   — solve attempt number.
+* ``duration``        — solve duration in seconds.
+* ``outcome``         — terminal outcome string.
+* ``error_type``      — exception class name when available.
+"""
+
+cloudflare_validation_started = object()
+"""Fired when clearance validation begins.
+
+Keyword arguments:
+* ``request``        — originating Scrapy request.
+* ``url``            — request URL.
+* ``method``         — HTTP method.
+* ``mode``           — ``"page"`` or ``"fetch"``.
+* ``context_name``   — logical name of the context.
+* ``challenge_type`` — challenge classification.
+* ``attempt_count``  — solve attempt number.
+* ``probe_url``      — validation URL.
+"""
+
+cloudflare_validation_completed = object()
+"""Fired when clearance validation succeeds.
+
+Keyword arguments:
+* ``request``        — originating Scrapy request.
+* ``url``            — request URL.
+* ``method``         — HTTP method.
+* ``mode``           — ``"page"`` or ``"fetch"``.
+* ``context_name``   — logical name of the context.
+* ``challenge_type`` — challenge classification.
+* ``attempt_count``  — solve attempt number.
+* ``probe_url``      — validation URL.
+* ``duration``       — validation duration in seconds.
+* ``validated_url``  — URL that proved clearance.
+"""
+
+cloudflare_validation_failed = object()
+"""Fired when clearance validation fails.
+
+Keyword arguments:
+* ``request``         — originating Scrapy request.
+* ``url``             — request URL.
+* ``method``          — HTTP method.
+* ``mode``            — ``"page"`` or ``"fetch"``.
+* ``context_name``    — logical name of the context.
+* ``challenge_type``  — challenge classification.
+* ``attempt_count``   — solve attempt number.
+* ``probe_url``       — validation URL.
+* ``duration``        — validation duration in seconds.
+* ``outcome``         — failure outcome string.
+* ``error_type``      — exception class name when available.
+"""
+
+playwright_blocked = object()
+"""Fired for terminal blocked outcomes that matter operationally.
+
+Keyword arguments:
+* ``request``         — originating Scrapy request.
+* ``url``             — request URL.
+* ``method``          — HTTP method.
+* ``mode``            — ``"page"`` or ``"fetch"``.
+* ``context_name``    — logical name of the context.
+* ``challenge_type``  — challenge classification when known.
+* ``blocked_reason``  — normalized reason string.
+* ``status``          — response status code when available.
+* ``resp_url``        — final response URL when available.
+* ``cf_mitigated``    — ``Cf-Mitigated`` response header if present.
+* ``attempt_count``   — solve attempt number when applicable.
+* ``error_type``      — exception class name when applicable.
+"""

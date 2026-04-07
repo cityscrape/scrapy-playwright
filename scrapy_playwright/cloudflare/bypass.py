@@ -8,6 +8,7 @@ import asyncio
 import logging
 import random
 from contextlib import suppress
+from time import time
 from typing import TYPE_CHECKING, Dict, Optional
 from urllib.parse import urlparse
 
@@ -26,6 +27,7 @@ from scrapy_playwright.cloudflare.types import (
     resolve_first_party_url,
 )
 from scrapy_playwright.cloudflare.diagnostics import CloudflareDiagnostics
+from scrapy_playwright import signals as pw_signals
 
 if TYPE_CHECKING:
     from scrapy_playwright.playwright import PlaywrightContext, PlaywrightEngine
@@ -59,6 +61,66 @@ class CloudflareBypass:
         self._solve_lock = asyncio.Lock()
         self._diagnostics = CloudflareDiagnostics(engine)
 
+    @staticmethod
+    def _mode_for_request(request: Request) -> str:
+        return "fetch" if request.meta.get("playwright_fetch") else "page"
+
+    @staticmethod
+    def _header_to_str(value) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, list):
+            value = value[0] if value else None
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
+
+    def _event_attrs(
+        self,
+        request: Request,
+        *,
+        context_name: str,
+        challenge_type: Optional[ChallengeType] = None,
+        attempt_count: Optional[int] = None,
+        response: Optional[Response] = None,
+        blocked_reason: Optional[str] = None,
+        outcome: Optional[str] = None,
+        duration: Optional[float] = None,
+        error_type: Optional[str] = None,
+        probe_url: Optional[str] = None,
+        validated_url: Optional[str] = None,
+    ) -> dict:
+        attrs = {
+            "request": request,
+            "url": request.url,
+            "method": request.method,
+            "mode": self._mode_for_request(request),
+            "context_name": context_name,
+        }
+        if challenge_type is not None:
+            attrs["challenge_type"] = challenge_type.value
+        if attempt_count is not None:
+            attrs["attempt_count"] = attempt_count
+        if response is not None:
+            attrs["status"] = response.status
+            attrs["resp_url"] = response.url
+            attrs["cf_mitigated"] = self._header_to_str(
+                response.headers.get(b"Cf-Mitigated"),
+            )
+        if blocked_reason is not None:
+            attrs["blocked_reason"] = blocked_reason
+        if outcome is not None:
+            attrs["outcome"] = outcome
+        if duration is not None:
+            attrs["duration"] = duration
+        if error_type is not None:
+            attrs["error_type"] = error_type
+        if probe_url is not None:
+            attrs["probe_url"] = probe_url
+        if validated_url is not None:
+            attrs["validated_url"] = validated_url
+        return attrs
+
     # ── Public API used by the engine ──────────────────────────────────
 
     async def wait_if_solving(self, context_name: str, request: Request) -> None:
@@ -81,8 +143,29 @@ class CloudflareBypass:
         used to retry the original request after solving.
         """
         challenge_type = classify_challenge(response)
-        if challenge_type in (ChallengeType.NONE, ChallengeType.PLAIN_403):
+        if challenge_type == ChallengeType.NONE:
             return response
+        if challenge_type == ChallengeType.PLAIN_403:
+            self._engine._emit_signal(
+                pw_signals.playwright_blocked,
+                **self._event_attrs(
+                    request,
+                    context_name=context_name,
+                    challenge_type=challenge_type,
+                    response=response,
+                    blocked_reason="cloudflare_plain_403",
+                ),
+            )
+            return response
+        self._engine._emit_signal(
+            pw_signals.cloudflare_challenge_detected,
+            **self._event_attrs(
+                request,
+                context_name=context_name,
+                challenge_type=challenge_type,
+                response=response,
+            ),
+        )
         self._diagnostics.log_response_summary(
             response, label="challenge_detected", request=request,
         )
@@ -107,7 +190,16 @@ class CloudflareBypass:
             request.method, request.url,
         )
         self._engine._inc_stat("playwright/cloudflare/parked_count")
+        parked_start = time()
         await info.solve_event.wait()
+        self._engine._emit_signal(
+            pw_signals.cloudflare_request_parked,
+            **self._event_attrs(
+                request,
+                context_name=request.meta.get("playwright_context", "default"),
+                duration=time() - parked_start,
+            ),
+        )
 
     # ── Reactive challenge handling ────────────────────────────────────
 
@@ -171,6 +263,17 @@ class CloudflareBypass:
             info.state = ChallengeState.FAILED
             if info.solve_event:
                 info.solve_event.set()
+            self._engine._emit_signal(
+                pw_signals.playwright_blocked,
+                **self._event_attrs(
+                    request,
+                    context_name=context_name,
+                    challenge_type=challenge_type,
+                    response=response,
+                    attempt_count=info.attempt_count,
+                    blocked_reason="cloudflare_max_retries",
+                ),
+            )
             return response
 
         logger.info(
@@ -181,10 +284,20 @@ class CloudflareBypass:
         )
         self._engine._inc_stat("playwright/cloudflare/challenge_count")
         self._engine._inc_stat(f"playwright/cloudflare/challenge_type/{challenge_type.value}")
+        self._engine._emit_signal(
+            pw_signals.cloudflare_solve_started,
+            **self._event_attrs(
+                request,
+                context_name=context_name,
+                challenge_type=challenge_type,
+                attempt_count=info.attempt_count,
+            ),
+        )
 
         if challenge_type == ChallengeType.TURNSTILE:
             self._diagnostics.log_turnstile_diagnostics(response)
 
+        solve_started_at = time()
         try:
             solved = await self._solve(request, spider, context_name, info)
             if solved:
@@ -196,6 +309,18 @@ class CloudflareBypass:
                     info.attempt_count, info.last_validated_url,
                 )
                 self._engine._inc_stat("playwright/cloudflare/solve_success_count")
+                self._engine._emit_signal(
+                    pw_signals.cloudflare_solve_completed,
+                    **self._event_attrs(
+                        request,
+                        context_name=context_name,
+                        challenge_type=info.challenge_type,
+                        attempt_count=info.attempt_count,
+                        duration=time() - solve_started_at,
+                        outcome="validated",
+                        validated_url=info.last_validated_url,
+                    ),
+                )
             else:
                 info.state = ChallengeState.FAILED
                 logger.warning(
@@ -205,6 +330,17 @@ class CloudflareBypass:
                     info.attempt_count,
                 )
                 self._engine._inc_stat("playwright/cloudflare/solve_failed_count")
+                self._engine._emit_signal(
+                    pw_signals.cloudflare_solve_failed,
+                    **self._event_attrs(
+                        request,
+                        context_name=context_name,
+                        challenge_type=info.challenge_type,
+                        attempt_count=info.attempt_count,
+                        duration=time() - solve_started_at,
+                        outcome="solve_failed",
+                    ),
+                )
         except Exception as exc:
             info.state = ChallengeState.FAILED
             info.error = exc
@@ -213,6 +349,18 @@ class CloudflareBypass:
                 context_name, exc, exc_info=True,
             )
             self._engine._inc_stat("playwright/cloudflare/solve_failed_count")
+            self._engine._emit_signal(
+                pw_signals.cloudflare_solve_failed,
+                **self._event_attrs(
+                    request,
+                    context_name=context_name,
+                    challenge_type=info.challenge_type,
+                    attempt_count=info.attempt_count,
+                    duration=time() - solve_started_at,
+                    outcome="solve_error",
+                    error_type=type(exc).__name__,
+                ),
+            )
         finally:
             info.solver_marker = None
             if info.solve_event:
@@ -221,6 +369,22 @@ class CloudflareBypass:
         if info.state == ChallengeState.VALIDATED:
             await asyncio.sleep(1.0 + (0.5 * info.attempt_count))
             return await dispatch_fn(request, spider)
+        self._engine._emit_signal(
+            pw_signals.playwright_blocked,
+            **self._event_attrs(
+                request,
+                context_name=context_name,
+                challenge_type=info.challenge_type,
+                response=response,
+                attempt_count=info.attempt_count,
+                blocked_reason=(
+                    "cloudflare_solve_error"
+                    if info.error is not None
+                    else "cloudflare_solve_failed"
+                ),
+                error_type=type(info.error).__name__ if info.error else None,
+            ),
+        )
         return response
 
     # ── Solve cycle ────────────────────────────────────────────────────
@@ -374,6 +538,17 @@ class CloudflareBypass:
     ) -> bool:
         probe_url = resolve_first_party_url(request, self._seed_url, for_fetch=True)
         logger.info("[Cloudflare] Validation probe → %s", probe_url)
+        validation_started_at = time()
+        self._engine._emit_signal(
+            pw_signals.cloudflare_validation_started,
+            **self._event_attrs(
+                request,
+                context_name=pw_ctx.name,
+                challenge_type=info.challenge_type,
+                attempt_count=info.attempt_count,
+                probe_url=probe_url,
+            ),
+        )
 
         try:
             await self._diagnostics.log_page_snapshot(
@@ -401,6 +576,18 @@ class CloudflareBypass:
                     self._engine._set_stat(
                         "playwright/cloudflare/last_validated_url", current_url,
                     )
+                    self._engine._emit_signal(
+                        pw_signals.cloudflare_validation_completed,
+                        **self._event_attrs(
+                            request,
+                            context_name=pw_ctx.name,
+                            challenge_type=info.challenge_type,
+                            attempt_count=info.attempt_count,
+                            probe_url=probe_url,
+                            duration=time() - validation_started_at,
+                            validated_url=current_url,
+                        ),
+                    )
                     return True
             probe_resp = await page.goto(
                 probe_url,
@@ -409,6 +596,18 @@ class CloudflareBypass:
             )
             if probe_resp is None:
                 logger.warning("[Cloudflare] Validation probe returned None")
+                self._engine._emit_signal(
+                    pw_signals.cloudflare_validation_failed,
+                    **self._event_attrs(
+                        request,
+                        context_name=pw_ctx.name,
+                        challenge_type=info.challenge_type,
+                        attempt_count=info.attempt_count,
+                        probe_url=probe_url,
+                        duration=time() - validation_started_at,
+                        outcome="probe_none",
+                    ),
+                )
                 return False
 
             status = probe_resp.status
@@ -430,6 +629,18 @@ class CloudflareBypass:
                     "[Cloudflare] Validation probe still challenged (status=%d)",
                     status,
                 )
+                self._engine._emit_signal(
+                    pw_signals.cloudflare_validation_failed,
+                    **self._event_attrs(
+                        request,
+                        context_name=pw_ctx.name,
+                        challenge_type=info.challenge_type,
+                        attempt_count=info.attempt_count,
+                        probe_url=probe_url,
+                        duration=time() - validation_started_at,
+                        outcome="challenge",
+                    ),
+                )
                 return False
 
             body = await page.content()
@@ -438,6 +649,18 @@ class CloudflareBypass:
                     "[Cloudflare] Validation probe body has challenge markers",
                 )
                 self._diagnostics.dump_challenge_html(body, pw_ctx.name, info)
+                self._engine._emit_signal(
+                    pw_signals.cloudflare_validation_failed,
+                    **self._event_attrs(
+                        request,
+                        context_name=pw_ctx.name,
+                        challenge_type=info.challenge_type,
+                        attempt_count=info.attempt_count,
+                        probe_url=probe_url,
+                        duration=time() - validation_started_at,
+                        outcome="body_markers",
+                    ),
+                )
                 return False
 
             await self._diagnostics.log_page_snapshot(
@@ -447,11 +670,36 @@ class CloudflareBypass:
             self._engine._set_stat(
                 "playwright/cloudflare/last_validated_url", probe_url,
             )
+            self._engine._emit_signal(
+                pw_signals.cloudflare_validation_completed,
+                **self._event_attrs(
+                    request,
+                    context_name=pw_ctx.name,
+                    challenge_type=info.challenge_type,
+                    attempt_count=info.attempt_count,
+                    probe_url=probe_url,
+                    duration=time() - validation_started_at,
+                    validated_url=probe_url,
+                ),
+            )
             return True
 
         except Exception as exc:
             logger.error(
                 "[Cloudflare] Validation probe failed: %s", exc, exc_info=True,
+            )
+            self._engine._emit_signal(
+                pw_signals.cloudflare_validation_failed,
+                **self._event_attrs(
+                    request,
+                    context_name=pw_ctx.name,
+                    challenge_type=info.challenge_type,
+                    attempt_count=info.attempt_count,
+                    probe_url=probe_url,
+                    duration=time() - validation_started_at,
+                    outcome="error",
+                    error_type=type(exc).__name__,
+                ),
             )
             return False
 

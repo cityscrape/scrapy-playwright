@@ -220,11 +220,15 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                 cf_seed_url=self.config.cf_seed_url,
                 cf_seed_timeout=self.config.cf_seed_timeout,
                 cf_wait_timeout=self.config.cf_wait_timeout,
+                signal_dispatcher=self._emit_signal,
             )
             pw.on_stats_inc = self.stats.inc_value
             pw.on_stats_set = self.stats.set_value
 
-            cf_gate = CfGate(enabled=self.config.cf_challenge_retry)
+            cf_gate = CfGate(
+                enabled=self.config.cf_challenge_retry,
+                emit_signal=self._emit_signal,
+            )
 
             shared = {
                 "pw": pw,
@@ -250,6 +254,9 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
     def _spider_closed(self, spider: Spider, reason: str) -> None:
         logger.info("[Lifecycle] _spider_closed reason=%s", reason)
         self.pw.is_closing = True
+
+    def _emit_signal(self, signal, **kwargs) -> None:
+        self._crawler.signals.send_catch_log(signal, **kwargs)
 
     @classmethod
     def from_crawler(cls: Type[PlaywrightHandler], crawler: Crawler) -> PlaywrightHandler:
@@ -371,7 +378,13 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                         request.method, request.url,
                     )
                     response = await self._do_download(request, spider)
-                    await self._cf_gate.maybe_open(response)
+                    await self._cf_gate.maybe_open(
+                        response,
+                        url=request.url,
+                        method=request.method,
+                        mode="fetch" if request.meta.get("playwright_fetch") else "page",
+                        context_name=request.meta.get("playwright_context", "default"),
+                    )
                     return response
 
         return await self._do_download(request, spider)

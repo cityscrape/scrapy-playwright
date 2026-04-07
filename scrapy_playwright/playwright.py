@@ -37,6 +37,7 @@ from scrapy.http.headers import Headers
 from scrapy.responsetypes import responsetypes
 from scrapy.utils.misc import load_object
 
+from scrapy_playwright import signals as pw_signals
 from scrapy_playwright.network_recorder import NetworkRecorder
 from scrapy_playwright.page import PageMethod, PagePool, POOL_STRATEGY_REUSE_FIRST
 from scrapy_playwright._utils import (
@@ -167,6 +168,7 @@ class PlaywrightEngine:
         cf_seed_url: Optional[str] = None,
         cf_seed_timeout: int = 90_000,
         cf_wait_timeout: int = 60_000,
+        signal_dispatcher: Optional[Callable] = None,
     ) -> None:
         # Connection
         self._cdp_url = cdp_url
@@ -194,6 +196,7 @@ class PlaywrightEngine:
         # Request processing
         self.process_request_headers = process_request_headers
         self.abort_request = abort_request
+        self._signal_dispatcher = signal_dispatcher
 
         # Runtime state
         self.playwright_context_manager: Optional[PlaywrightContextManager] = None
@@ -263,6 +266,10 @@ class PlaywrightEngine:
     def _set_stat(self, name: str, value) -> None:
         if self.on_stats_set:
             self.on_stats_set(name, value)
+
+    def _emit_signal(self, signal, **kwargs) -> None:
+        if self._signal_dispatcher is not None:
+            self._signal_dispatcher(signal, **kwargs)
 
     @staticmethod
     def _sanitize_for_log(data):
@@ -368,6 +375,10 @@ class PlaywrightEngine:
                 self.browser_type = getattr(self.playwright, self._browser_type_name)
             self._driver_dead = False
             self._inc_stat("playwright/driver_restart_count")
+            self._emit_signal(
+                pw_signals.driver_restarted,
+                browser_type=self._browser_type_name,
+            )
             logger.info("[Lifecycle] restart DONE")
 
     async def close(self) -> None:
@@ -443,6 +454,10 @@ class PlaywrightEngine:
     async def _on_browser_disconnected(self) -> None:
         logger.info("[Lifecycle] browser disconnected")
         self._driver_dead = True
+        self._emit_signal(
+            pw_signals.browser_disconnected,
+            restart_enabled=self._restart_disconnected_browser,
+        )
         for ctx in self.contexts.values():
             if ctx.recorder:
                 ctx.recorder.finalize()
@@ -556,6 +571,12 @@ class PlaywrightEngine:
                 navigation_timeout=self._navigation_timeout,
             )
             self.contexts[name] = pw_ctx
+            self._emit_signal(
+                pw_signals.context_created,
+                context_name=name,
+                persistent=persistent,
+                remote=bool(self._cdp_url or self._connect_url),
+            )
             for page in list(context.pages):
                 self._register_page(page, pw_ctx, spider=spider)
                 adopted = await pw_ctx.pool.adopt(page)
@@ -615,6 +636,12 @@ class PlaywrightEngine:
         if is_new:
             self._inc_stat("playwright/page_count")
             self._register_page(page, pw_ctx, spider=spider)
+            self._emit_signal(
+                pw_signals.page_created,
+                context_name=pw_ctx.name,
+                context_page_count=len(pw_ctx.context.pages),
+                total_page_count=self.get_total_page_count(),
+            )
 
         return page, pw_ctx, is_new
 
@@ -797,6 +824,13 @@ class PlaywrightEngine:
         resp_body_text = result.get("body", "")
         body_bytes, encoding = _encode_body(headers=resp_headers, text=resp_body_text)
         request.meta["download_latency"] = time() - start_time
+        self._emit_signal(
+            pw_signals.fetch_executed,
+            url=request.url,
+            method=request.method,
+            status=status,
+            duration=request.meta["download_latency"],
+        )
 
         respcls = responsetypes.from_args(headers=resp_headers, url=request.url, body=body_bytes)
         self._inc_stat("playwright/fetch_count")

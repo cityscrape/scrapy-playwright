@@ -21,8 +21,10 @@ from scrapy.http import Request, Response
 
 from scrapy_playwright.cloudflare.types import (
     ContextChallengeInfo,
+    ChallengeType,
     body_has_challenge_markers,
 )
+from scrapy_playwright import signals as pw_signals
 
 if TYPE_CHECKING:
     from scrapy_playwright.playwright import PlaywrightContext
@@ -288,6 +290,22 @@ class CloudflareDiagnostics:
                     "playwright/cloudflare/last_private_token_challenge_url",
                     private_token_challenge["url"],
                 )
+                request = getattr(response, "request", None)
+                if request is not None:
+                    context_name = getattr(request.frame.page, "context", None)
+                    self._engine._emit_signal(
+                        pw_signals.playwright_blocked,
+                        request=None,
+                        url=request.url,
+                        method=request.method,
+                        mode="page" if request.resource_type == "document" else request.resource_type,
+                        context_name=getattr(getattr(context_name, "_impl_obj", None), "_guid", "unknown"),
+                        challenge_type=ChallengeType.MANAGED_CHALLENGE.value,
+                        blocked_reason="private_token_challenge",
+                        status=response.status,
+                        resp_url=response.url,
+                        cf_mitigated=headers.get("cf-mitigated"),
+                    )
                 logger.warning(
                     "[Cloudflare] PrivateToken challenge encountered at %s. "
                     "The browser did not satisfy Cloudflare's PAT step and received 401 "
