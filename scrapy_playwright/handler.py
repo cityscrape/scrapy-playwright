@@ -20,9 +20,11 @@ from scrapy.utils.reactor import verify_installed_reactor
 from twisted.internet.defer import Deferred, inlineCallbacks
 
 from scrapy_playwright import signals as pw_signals
+from scrapy_playwright.cloudflare.gate import CfGate
 from scrapy_playwright.headers import use_scrapy_headers
 from scrapy_playwright.playwright import (
-    Playwright,
+    PlaywrightEngine,
+    PlaywrightEngine as Playwright,  # noqa: F401 (back-compat re-export)
     PlaywrightContext,  # noqa: F401 (back-compat re-export)
     Download,  # noqa: F401 (back-compat re-export)
     DEFAULT_CONTEXT_NAME,  # noqa: F401 (back-compat re-export)
@@ -193,14 +195,13 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
 
         shared = self._shared_by_crawler_id.get(self._crawler_id)
         if shared is None:
-            pw = Playwright(
+            pw = PlaywrightEngine(
                 browser_type_name=self.config.browser_type_name,
                 launch_options=self.config.launch_options,
                 camoufox_options=self.config.camoufox_options,
                 max_pages_per_context=self.config.max_pages_per_context,
                 navigation_timeout=self.config.navigation_timeout,
                 close_page_after_request=self.config.close_page_after_request,
-                pool_enabled=self.config.page_pooling,
                 pool_strategy=self.config.page_pool_strategy,
                 stealth_init_scripts=self.config.stealth_init_scripts,
                 har_recording=self.config.har_recording,
@@ -223,14 +224,11 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
             pw.on_stats_inc = self.stats.inc_value
             pw.on_stats_set = self.stats.set_value
 
-            cf_gate = asyncio.Event()
-            if not self.config.cf_challenge_retry:
-                cf_gate.set()
+            cf_gate = CfGate(enabled=self.config.cf_challenge_retry)
 
             shared = {
                 "pw": pw,
                 "cf_gate": cf_gate,
-                "cf_serial_lock": asyncio.Lock(),
                 "launch_lock": asyncio.Lock(),
                 "close_lock": asyncio.Lock(),
                 "launched": False,
@@ -247,8 +245,7 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         shared["refcount"] += 1
         self._shared_state = shared
         self.pw = shared["pw"]
-        self._cf_gate = shared["cf_gate"]
-        self._cf_serial_lock = shared["cf_serial_lock"]
+        self._cf_gate: CfGate = shared["cf_gate"]
 
     def _spider_closed(self, spider: Spider, reason: str) -> None:
         logger.info("[Lifecycle] _spider_closed reason=%s", reason)
@@ -361,38 +358,23 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         """Entry point for Playwright downloads.
 
         When Cloudflare challenge-retry is enabled, requests are serialized
-        (one at a time) until ``cf_clearance`` is found in the browser
-        context.  After that the gate opens and requests proceed in parallel.
+        (one at a time) until an unchallenged response is observed. After
+        that the gate opens and requests proceed in parallel.
         """
         spider = spider or self._crawler.spider
 
-        if not self._cf_gate.is_set():
-            async with self._cf_serial_lock:
-                # Re-check: another request may have opened the gate while
-                # we were waiting for the lock.
-                if not self._cf_gate.is_set():
+        if not self._cf_gate.is_open:
+            async with self._cf_gate.serial_lock:
+                if not self._cf_gate.is_open:
                     logger.debug(
                         "[CfGate] Serialized request through: %s %s",
                         request.method, request.url,
                     )
                     response = await self._do_download(request, spider)
-                    await self._maybe_open_cf_gate()
+                    await self._cf_gate.maybe_open(response)
                     return response
 
         return await self._do_download(request, spider)
-
-    async def _maybe_open_cf_gate(self) -> None:
-        """Open the serialization gate if any context has ``cf_clearance``."""
-        if self._cf_gate.is_set():
-            return
-        for pw_ctx in self.pw.contexts.values():
-            cookies = await pw_ctx.context.cookies()
-            if any(c["name"] == "cf_clearance" for c in cookies):
-                logger.info(
-                    "[CfGate] cf_clearance found — allowing parallel requests"
-                )
-                self._cf_gate.set()
-                return
 
     # ── Retry loop with driver-dead detection ─────────────────────────
 
