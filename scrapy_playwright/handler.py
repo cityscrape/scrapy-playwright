@@ -177,6 +177,19 @@ class Config:
         return cfg
 
 
+def _context_name_from_session(session_key: Optional[str]) -> Optional[str]:
+    """Map a readiness ``session`` value to a Playwright context name.
+
+    Accepts ``"browser:<name>"`` (the readiness convention) or a bare context
+    name. Returns ``None`` when no session was declared.
+    """
+    if not session_key:
+        return None
+    if session_key.startswith("browser:"):
+        return session_key.split(":", 1)[1] or DEFAULT_CONTEXT_NAME
+    return session_key
+
+
 class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
     _shared_by_crawler_id: dict[int, dict] = {}
 
@@ -280,6 +293,44 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         self.pw = shared["pw"]
         self._cf_gate: CfGate = shared["cf_gate"]
 
+        # Expose Playwright runtime handles to Scrapy's readiness framework so
+        # readiness checks can inspect the live browser context/page for the
+        # session a parked request is waiting on.
+        crawler.readiness_runtime_provider = self._readiness_runtime_provider
+
+    def _readiness_runtime_provider(self, session_key, request=None) -> dict:
+        """Resolve the Playwright context/page handles for a readiness session.
+
+        ``session_key`` follows the readiness convention ``"browser:<name>"``;
+        a bare context name is also accepted. When the session-derived name
+        does not match a live context (e.g. the readiness config names
+        ``default`` but the project runs a custom-named context), this falls
+        back to the request's ``playwright_context`` meta, the configured
+        ``PLAYWRIGHT_DEFAULT_CONTEXT``, and finally the sole live context.
+
+        Returns an empty dict while no context has been created yet, so
+        readiness checks simply stay not-ready until the session is warmed.
+        """
+        contexts = self.pw.contexts
+        context_name = _context_name_from_session(session_key)
+        if context_name not in contexts:
+            fallbacks = []
+            if request is not None:
+                fallbacks.append(request.meta.get("playwright_context"))
+            fallbacks.append(self._crawler.settings.get("PLAYWRIGHT_DEFAULT_CONTEXT"))
+            fallbacks.append(DEFAULT_CONTEXT_NAME)
+            context_name = next(
+                (name for name in fallbacks if name and name in contexts),
+                # As a last resort, if exactly one context exists, use it.
+                next(iter(contexts)) if len(contexts) == 1 else None,
+            )
+        pw_ctx = contexts.get(context_name) if context_name else None
+        if pw_ctx is None:
+            return {}
+        browser_context = pw_ctx.context
+        pages = list(getattr(browser_context, "pages", []) or [])
+        return {"context": browser_context, "page": pages[0] if pages else None}
+
     def _spider_closed(self, spider: Spider, reason: str) -> None:
         logger.info("[Lifecycle] _spider_closed reason=%s", reason)
         self.pw.is_closing = True
@@ -317,6 +368,13 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                     self._crawler_id,
                 )
                 return
+            logger.info(
+                "[Lifecycle] Spider startup spider=%s version=%s browser_type=%s crawler_id=%s",
+                getattr(self._crawler.spider, "name", "unknown"),
+                self._crawler.settings.get("VERSION") or "unknown",
+                self.config.browser_type_name,
+                self._crawler_id,
+            )
             await self.pw.launch(
                 startup_context_kwargs=self.config.startup_context_kwargs or None,
             )
