@@ -10,6 +10,7 @@ import asyncio
 import json as _json
 import logging
 import pathlib
+import re
 from contextlib import suppress
 from functools import partial
 from ipaddress import ip_address
@@ -49,6 +50,7 @@ from scrapy_playwright._utils import (
 )
 from scrapy_playwright.cloudflare.bypass import CloudflareBypass
 from scrapy_playwright.cloudflare.diagnostics import CloudflareDiagnostics
+from scrapy_playwright.cloudflare.remediation import RemediationInput, RemediationManager
 from scrapy_playwright import camoufox_backend
 
 logger = logging.getLogger("scrapy-playwright")
@@ -103,6 +105,7 @@ class PlaywrightContext:
         self.persistent = persistent
         self.recorder = recorder
         self._navigation_timeout = navigation_timeout
+        self._retained_pages: set[Page] = set()
 
         self.pool = PagePool(
             max_pages,
@@ -118,6 +121,34 @@ class PlaywrightContext:
 
     def return_page(self, page: Page) -> None:
         self.pool.release(page)
+
+    def retain_page(self, page: Page) -> None:
+        if not page.is_closed():
+            self._retained_pages.add(page)
+
+    def forget_page(self, page: Optional[Page]) -> None:
+        if page is not None:
+            self._retained_pages.discard(page)
+
+    def is_retained_page(self, page: Page) -> bool:
+        return page in self._retained_pages
+
+    async def get_retained_page(self, seed_url: Optional[str] = None) -> Optional[Page]:
+        """Return a retained non-closed page, preferring the seed host."""
+        seed_host = urlparse(seed_url or "").netloc
+        fallback = None
+        for page in list(self._retained_pages):
+            if page.is_closed():
+                self._retained_pages.discard(page)
+                continue
+            if fallback is None:
+                fallback = page
+            page_host = urlparse(page.url or "").netloc
+            if seed_host and page_host == seed_host:
+                return page
+            if seed_host and (page.url or "") == "about:blank":
+                fallback = page
+        return fallback
 
     async def drain_pool(self) -> None:
         await self.pool.drain()
@@ -168,6 +199,11 @@ class PlaywrightEngine:
         cf_seed_url: Optional[str] = None,
         cf_seed_timeout: int = 90_000,
         cf_wait_timeout: int = 60_000,
+        antibot_remediation_enabled: bool = False,
+        antibot_remediation_actions: Optional[list] = None,
+        profile_rotation_archive_dir: Optional[str] = None,
+        fetch_failure_artifacts_enabled: bool = False,
+        fetch_failure_artifacts_dir: pathlib.Path = pathlib.Path("playwright_fetch_failures"),
         signal_dispatcher: Optional[Callable] = None,
     ) -> None:
         # Connection
@@ -197,6 +233,9 @@ class PlaywrightEngine:
         self.process_request_headers = process_request_headers
         self.abort_request = abort_request
         self._signal_dispatcher = signal_dispatcher
+        self._profile_rotation_archive_dir = profile_rotation_archive_dir
+        self._fetch_failure_artifacts_enabled = fetch_failure_artifacts_enabled
+        self._fetch_failure_artifacts_dir = fetch_failure_artifacts_dir
 
         # Runtime state
         self.playwright_context_manager: Optional[PlaywrightContextManager] = None
@@ -204,6 +243,7 @@ class PlaywrightEngine:
         self.browser_type: Optional[BrowserType] = None
         self._browser: Optional[Browser] = None
         self._camoufox_launchers: Dict[str, object] = {}
+        self._context_kwargs_by_name: Dict[str, dict] = {}
         self._driver_dead = False
         self._is_closing = False
 
@@ -234,6 +274,11 @@ class PlaywrightEngine:
             )
         else:
             self._cf_bypass = None
+        self._remediation = RemediationManager(
+            engine=self,
+            enabled=antibot_remediation_enabled,
+            actions=antibot_remediation_actions,
+        )
 
         # Callback hooks — the handler wires these after construction.
         self.on_stats_inc: Optional[Callable] = None
@@ -270,6 +315,31 @@ class PlaywrightEngine:
     def _emit_signal(self, signal, **kwargs) -> None:
         if self._signal_dispatcher is not None:
             self._signal_dispatcher(signal, **kwargs)
+
+    async def remediate_antibot_block(self, event: RemediationInput) -> None:
+        await self._remediation.remediate(event)
+
+    def get_context_user_data_dir(self, context_name: str) -> Optional[str]:
+        context_kwargs = self._context_kwargs_by_name.get(context_name) or {}
+        value = context_kwargs.get(PERSISTENT_CONTEXT_PATH_KEY)
+        if value is not None:
+            return str(value)
+        if self._uses_camoufox_backend:
+            camoufox_options = camoufox_backend.prepare_launch_options(
+                self._launch_options,
+                self._camoufox_options,
+                context_kwargs,
+            )
+            value = camoufox_options.get(PERSISTENT_CONTEXT_PATH_KEY)
+            if value is not None:
+                return str(value)
+        return None
+
+    def get_context_name_for_playwright_context(self, playwright_context: BrowserContext) -> str:
+        for name, pw_ctx in self.contexts.items():
+            if pw_ctx.context is playwright_context:
+                return name
+        return "unknown"
 
     @staticmethod
     def _sanitize_for_log(data):
@@ -497,6 +567,7 @@ class PlaywrightEngine:
         if self._context_semaphore is not None:
             await self._context_semaphore.acquire()
         context_kwargs = context_kwargs or {}
+        self._context_kwargs_by_name[name] = dict(context_kwargs)
         recorder = self._create_network_recorder(name, context_kwargs)
         if recorder:
             logger.info("Network recording enabled for context '%s'", name)
@@ -612,7 +683,11 @@ class PlaywrightEngine:
         async with self._context_launch_lock:
             pw_ctx = self.contexts.get(context_name)
             if pw_ctx is None:
-                context_kwargs = dict(request.meta.get("playwright_context_kwargs") or {})
+                context_kwargs = dict(
+                    request.meta.get("playwright_context_kwargs")
+                    or self._context_kwargs_by_name.get(context_name)
+                    or {}
+                )
                 har_meta = request.meta.get("playwright_har")
                 if har_meta is not None:
                     context_kwargs["_playwright_har"] = har_meta
@@ -620,6 +695,21 @@ class PlaywrightEngine:
                     name=context_name, context_kwargs=context_kwargs, spider=spider,
                 )
         return pw_ctx
+
+    async def close_context(self, name: str) -> None:
+        pw_ctx = self.contexts.get(name)
+        if pw_ctx is None:
+            return
+        if pw_ctx.recorder:
+            pw_ctx.recorder.finalize()
+            self._set_stat("playwright/har_entry_count", pw_ctx.recorder.entry_count)
+        await pw_ctx.drain_pool()
+        with suppress(TargetClosedError):
+            await pw_ctx.context.close()
+        launcher = self._camoufox_launchers.pop(name, None)
+        if launcher is not None:
+            await camoufox_backend.close_launcher(name, launcher, self._camoufox_launchers)
+        self.contexts.pop(name, None)
 
     # ── Page lifecycle helpers ─────────────────────────────────────────
 
@@ -653,12 +743,36 @@ class PlaywrightEngine:
     async def return_or_close_page(self, request: Request, page: Page) -> None:
         context_name = request.meta.get("playwright_context", DEFAULT_CONTEXT_NAME)
         pw_ctx = self.contexts.get(context_name)
-        if pw_ctx is not None and pw_ctx.pool is not None and not page.is_closed():
+        if page.is_closed():
+            self._inc_stat("playwright/page_count/closed")
+            return
+        if self.should_close_page(request):
+            logger.debug(
+                "[Lifecycle] Closing page after request due to config "
+                "(context='%s', url=%s)",
+                context_name,
+                page.url,
+            )
+            await page.close()
+            self._inc_stat("playwright/page_count/closed")
+        elif pw_ctx is not None and pw_ctx.is_retained_page(page):
+            logger.debug(
+                "[Lifecycle] Page retained by response; not returning to pool "
+                "(context='%s', url=%s)",
+                context_name,
+                page.url,
+            )
+        elif pw_ctx is not None and pw_ctx.pool is not None:
+            logger.debug(
+                "[Lifecycle] Returning page to pool after request "
+                "(context='%s', url=%s)",
+                context_name,
+                page.url,
+            )
             pw_ctx.return_page(page)
             self._inc_stat("playwright/page_count/returned_to_pool")
         else:
-            if not page.is_closed():
-                await page.close()
+            await page.close()
             self._inc_stat("playwright/page_count/closed")
 
     # ── Fetch-style download ──────────────────────────────────────────
@@ -676,33 +790,62 @@ class PlaywrightEngine:
 
         pw_ctx = await self.get_or_create_context(request, spider)
 
-        existing = await pw_ctx.get_open_page()
-        if existing is not None:
-            return existing
-
-        # Determine seed URL
         seed_url = request.meta.get("playwright_fetch_seed_url")
         if not seed_url:
             referer = request.headers.get("Referer")
             if referer:
-                seed_url = referer.decode("utf-8") if isinstance(referer, bytes) else referer
+                seed_url = self._header_value_to_str(referer)
         if not seed_url:
             origin = request.headers.get("Origin")
             if origin:
-                seed_url = origin.decode("utf-8") if isinstance(origin, bytes) else origin
+                seed_url = self._header_value_to_str(origin)
+                if seed_url:
+                    seed_url = seed_url.rstrip("/") + "/"
         if not seed_url:
             parsed = urlparse(request.url)
             seed_url = f"{parsed.scheme}://{parsed.netloc}/"
 
-        logger.info(
-            "[Fetch] No open page in context '%s', seeding with %s",
-            context_name, seed_url,
-        )
-        page, is_new = await pw_ctx.acquire_page()
+        page = await pw_ctx.get_retained_page(seed_url)
+        is_new = False
+        if page is None:
+            logger.info(
+                "[Fetch] No retained page in context '%s', seeding with %s",
+                context_name, seed_url,
+            )
+            page, is_new = await pw_ctx.acquire_page()
+        else:
+            current_url = page.url or ""
+            current_host = urlparse(current_url).netloc
+            seed_host = urlparse(seed_url).netloc
+            if current_url == "about:blank" or (seed_host and current_host != seed_host):
+                logger.info(
+                    "[Fetch] Retained page in context '%s' is not fetch-ready "
+                    "(page=%s seed=%s); navigating before fetch",
+                    context_name,
+                    current_url,
+                    seed_url,
+                )
+                await page.goto(seed_url, wait_until="domcontentloaded")
+            else:
+                logger.debug(
+                    "[Fetch] Reusing retained page in context '%s' for fetch "
+                    "(page=%s seed=%s)",
+                    context_name,
+                    current_url,
+                    seed_url,
+                )
+            return page
+
         if is_new:
             self._inc_stat("playwright/page_count")
             self._register_page(page, pw_ctx, spider=spider)
         await page.goto(seed_url, wait_until="domcontentloaded")
+        pw_ctx.retain_page(page)
+        logger.debug(
+            "[Fetch] Retained new fetch carrier page (context='%s', url=%s)",
+            context_name,
+            page.url,
+        )
         return page
 
     def _register_page(
@@ -712,87 +855,377 @@ class PlaywrightEngine:
         spider: Optional[Spider] = None,
     ) -> None:
         """Attach lifecycle and network handlers to a newly discovered page."""
-        page.on("close", self._make_close_page_cb(pw_ctx.name))
-        page.on("crash", self._make_close_page_cb(pw_ctx.name))
+        page.on("close", self._make_close_page_cb(pw_ctx.name, page))
+        page.on("crash", self._make_close_page_cb(pw_ctx.name, page))
         page.on("request", self._on_playwright_request)
         page.on("response", self._on_playwright_response)
+        page.on("requestfailed", _make_requestfailed_logger(pw_ctx.name))
+        page.on("console", _make_console_logger(pw_ctx.name))
+        page.on("pageerror", _make_pageerror_logger(pw_ctx.name))
         if pw_ctx.recorder:
             page.on("response", pw_ctx.recorder.on_response)
+            page.on("requestfailed", pw_ctx.recorder.on_request_failed)
         if logger.getEffectiveLevel() <= logging.DEBUG:
             page.on("request", _make_request_logger(pw_ctx.name, spider))
             page.on("response", _make_response_logger(pw_ctx.name, spider))
 
     @staticmethod
     def build_fetch_js(
-        url: str, method: str, headers: dict, body: Optional[str],
+        url: str,
+        method: str,
+        headers: dict,
+        body: Optional[str],
+        credentials: str,
     ) -> str:
         fetch_opts: dict = {
             "method": method,
             "headers": headers,
-            "credentials": "include",
+            "credentials": credentials,
         }
         if body is not None:
             fetch_opts["body"] = body
         opts_json = _json.dumps(fetch_opts, ensure_ascii=False)
+        # Wrap in try/catch so a thrown TypeError ("NetworkError when attempting
+        # to fetch resource", CORS denial, mixed content, etc.) doesn't propagate
+        # out of page.evaluate as an opaque Playwright Error. Returning a tagged
+        # payload lets the Python side log the actual browser-side cause and the
+        # opaque/redirect response type when fetch resolved but the body wasn't
+        # readable.
         return (
             f"async () => {{"
-            f"  const r = await fetch({_json.dumps(url)}, {opts_json});"
-            f"  const hdrs = {{}};"
-            f"  r.headers.forEach((v, k) => {{ hdrs[k] = v; }});"
-            f"  const text = await r.text();"
-            f"  return {{status: r.status, statusText: r.statusText, headers: hdrs, body: text}};"
+            f"  try {{"
+            f"    const r = await fetch({_json.dumps(url)}, {opts_json});"
+            f"    const hdrs = {{}};"
+            f"    r.headers.forEach((v, k) => {{ hdrs[k] = v; }});"
+            f"    let text = '';"
+            f"    let bodyError = null;"
+            f"    try {{ text = await r.text(); }}"
+            f"    catch (be) {{ bodyError = {{name: be.name, message: String(be)}}; }}"
+            f"    return {{ok: true, status: r.status, statusText: r.statusText,"
+            f"             type: r.type, redirected: r.redirected, finalUrl: r.url,"
+            f"             headers: hdrs, body: text, bodyError: bodyError}};"
+            f"  }} catch (e) {{"
+            f"    return {{ok: false, errorName: e.name || 'UnknownError',"
+            f"             errorMessage: String(e), errorStack: e.stack || null}};"
+            f"  }}"
             f"}}"
         )
 
-    @staticmethod
-    def _sanitize_fetch_headers(headers: dict) -> dict:
-        """Drop headers that must come from the live browser request context.
+    # Headers that *must* be dropped: passing them to fetch() corrupts the
+    # request because the browser also sets them and the two versions would
+    # collide. ``Cookie`` duplicates the jar attached via ``credentials:
+    # include``; ``Content-Length`` and ``Host`` are derived from the body /
+    # URL and a stale spider-side value desyncs the request frame.
+    _FETCH_DROP_HEADERS = frozenset({
+        "accept-encoding",
+        "connection",
+        "content-length",
+        "cookie",
+        "host",
+        "origin",
+        "priority",
+        "referer",
+        "te",
+        "user-agent",
+    })
 
-        Browser-executed ``fetch()`` already derives cookies, UA, client hints,
-        fetch metadata, referer, host, and transfer details from the active page.
-        Replaying Scrapy-side values here can create mismatched identities such as:
-        - duplicate Cookie headers when ``credentials: include`` is set
-        - Chromium UA on a Firefox/Camoufox browser session
-        - stale Sec-Fetch / Content-Length / Host values
+    # Headers Firefox treats as "forbidden" in the Fetch spec — it silently
+    # ignores any value we pass and uses its own derived from the live page
+    # context (Origin/Referer/Sec-Fetch-*/Sec-Ch-Ua-*/UA/Accept-Encoding/
+    # Connection/etc.). We let them through anyway so the spider's intent is
+    # visible in the log line and so future Firefox versions that lift the
+    # restriction would honor the spider value automatically.
+    _FETCH_BROWSER_MANAGED_HEADERS = frozenset({
+        "accept-encoding",
+        "connection",
+        "origin",
+        "priority",
+        "referer",
+        "sec-ch-ua",
+        "sec-ch-ua-arch",
+        "sec-ch-ua-bitness",
+        "sec-ch-ua-full-version",
+        "sec-ch-ua-full-version-list",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-model",
+        "sec-ch-ua-platform",
+        "sec-ch-ua-platform-version",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "upgrade-insecure-requests",
+        "user-agent",
+    })
+
+    _FETCH_COOKIE_RELEVANT_RE = re.compile(
+        r"(?:vivareal|grupozap|cf|zap|datadome|dd)", re.IGNORECASE
+    )
+
+    _FETCH_STORAGE_RELEVANT_RE = re.compile(
+        r"(?:vivareal|grupozap|zap|cf|clearance|token|session)", re.IGNORECASE
+    )
+
+    @classmethod
+    def _sanitize_fetch_headers(cls, headers: dict) -> dict:
+        """Prepare spider headers for an in-page ``fetch()``.
+
+        Strategy: forward almost everything. Only drop the small set that
+        actively breaks the request when both the spider and the browser try
+        to set it (``Cookie`` / ``Content-Length`` / ``Host``). The larger
+        "browser-managed" group is passed through — Firefox will override it
+        from the live page context per the Fetch spec, but the spider's
+        intended values stay visible in the log.
         """
-        browser_owned = {
-            "accept-encoding",
-            "connection",
-            "content-length",
-            "cookie",
-            "host",
-            "origin",
-            "priority",
-            "referer",
-            "sec-ch-ua",
-            "sec-ch-ua-arch",
-            "sec-ch-ua-bitness",
-            "sec-ch-ua-full-version",
-            "sec-ch-ua-full-version-list",
-            "sec-ch-ua-mobile",
-            "sec-ch-ua-model",
-            "sec-ch-ua-platform",
-            "sec-ch-ua-platform-version",
-            "sec-fetch-dest",
-            "sec-fetch-mode",
-            "sec-fetch-site",
-            "sec-fetch-user",
-            "upgrade-insecure-requests",
-            "user-agent",
-        }
-        sanitized = {}
-        dropped = []
+        sanitized: dict = {}
+        dropped: list = []
+        browser_managed: list = []
         for name, value in headers.items():
-            if name.lower() in browser_owned:
+            lname = name.lower()
+            if lname in cls._FETCH_DROP_HEADERS:
                 dropped.append(name)
                 continue
+            if lname in cls._FETCH_BROWSER_MANAGED_HEADERS:
+                browser_managed.append(name)
             sanitized[name] = value
         if dropped:
             logger.info(
-                "[Fetch] Dropping browser-managed headers before fetch(): %s",
+                "[Fetch] Dropping conflicting headers before fetch(): %s",
                 ", ".join(sorted(dropped, key=str.lower)),
             )
+        if browser_managed:
+            logger.debug(
+                "[Fetch] Forwarding browser-managed headers (Firefox may "
+                "override from page context): %s",
+                ", ".join(sorted(browser_managed, key=str.lower)),
+            )
         return sanitized
+
+    @staticmethod
+    def _header_value_to_str(value) -> Optional[str]:
+        if isinstance(value, list):
+            if not value:
+                return None
+            value = value[-1]
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        if value is None:
+            return None
+        return str(value)
+
+    async def _describe_fetch_state(self, page: Page, url: str) -> dict:
+        """Collect a snapshot of page + cookie state for fetch diagnostics.
+
+        Always swallows exceptions: telemetry must never break the request.
+        Returns the loosely-typed dict consumed by the log lines in
+        ``download_with_fetch`` (also reused on the failure path so a
+        ``NetworkError`` log line shows the page origin and the cookies that
+        *would* have been attached to the request).
+        """
+        snapshot: dict = {
+            "page_url": None,
+            "cookies_for_url": [],
+            "context_cookies": [],
+            "context_cookie_count": None,
+            "document_cookie_len": None,
+            "cross_origin": None,
+            "storage": {"local": [], "session": []},
+        }
+        try:
+            snapshot["page_url"] = page.url
+        except Exception:
+            pass
+        try:
+            target = urlparse(url)
+            page_parsed = urlparse(snapshot["page_url"] or "")
+            if target.netloc and page_parsed.netloc:
+                snapshot["cross_origin"] = target.netloc != page_parsed.netloc
+        except Exception:
+            pass
+        try:
+            ctx_cookies = await page.context.cookies()
+            snapshot["context_cookie_count"] = len(ctx_cookies)
+            # Keep only fields a reader actually needs while debugging CF/CORS:
+            # the cookie name, domain (so we can spot scope drift), and value
+            # length (raw value is sensitive and noisy).  ``partitionKey`` is
+            # only present on Chromium today, but include defensively so we'd
+            # notice if Firefox ever surfaces it.
+            def _describe(c: dict) -> dict:
+                return {
+                    "name": c.get("name"),
+                    "domain": c.get("domain"),
+                    "path": c.get("path"),
+                    "value_len": len(c.get("value", "") or ""),
+                    "http_only": c.get("httpOnly"),
+                    "secure": c.get("secure"),
+                    "same_site": c.get("sameSite"),
+                    "partition_key": c.get("partitionKey"),
+                    "expires": c.get("expires"),
+                }
+            snapshot["context_cookies"] = [_describe(c) for c in ctx_cookies]
+            url_cookies = await page.context.cookies(url)
+            snapshot["cookies_for_url"] = [_describe(c) for c in url_cookies]
+        except Exception as exc:
+            logger.debug("[Fetch] Cookie snapshot failed: %s", exc)
+        try:
+            doc_cookie = await page.evaluate("() => document.cookie || ''")
+            snapshot["document_cookie_len"] = len(doc_cookie or "")
+        except Exception:
+            pass
+        try:
+            storage = await page.evaluate(
+                """() => {
+                    const summarize = (storage) => {
+                        const items = [];
+                        for (let i = 0; i < storage.length; i += 1) {
+                            const key = storage.key(i);
+                            const value = key == null ? '' : (storage.getItem(key) || '');
+                            items.push({key, valueLength: value.length});
+                        }
+                        return items;
+                    };
+                    return {
+                        local: summarize(window.localStorage),
+                        session: summarize(window.sessionStorage),
+                    };
+                }"""
+            )
+            snapshot["storage"] = {
+                "local": [
+                    item for item in storage.get("local", [])
+                    if self._FETCH_STORAGE_RELEVANT_RE.search(item.get("key") or "")
+                ],
+                "session": [
+                    item for item in storage.get("session", [])
+                    if self._FETCH_STORAGE_RELEVANT_RE.search(item.get("key") or "")
+                ],
+            }
+        except Exception:
+            pass
+        return snapshot
+
+    @staticmethod
+    def _body_snippet(text: Optional[str], limit: int = 500) -> str:
+        if not text:
+            return ""
+        compact = re.sub(r"\s+", " ", text)
+        return compact[:limit]
+
+    @classmethod
+    def _detect_block_indicators(cls, *, text: str, headers: dict, page_url: Optional[str]) -> list[str]:
+        indicators: list[str] = []
+        text_lower = (text or "").lower()
+        header_blob = _json.dumps(headers or {}, ensure_ascii=False).lower()
+        page_lower = (page_url or "").lower()
+        checks = {
+            "cloudflare_challenge": (
+                "cf-mitigated" in header_blob
+                or "cdn-cgi/challenge-platform" in text_lower
+                or "cf challenge" in text_lower
+                or "just a moment" in text_lower
+                or "attention required" in text_lower
+            ),
+            "access_denied": "access denied" in text_lower,
+            "captcha": "captcha" in text_lower or "turnstile" in text_lower,
+            "challenge_page_url": "cdn-cgi/challenge-platform" in page_lower,
+        }
+        for name, matched in checks.items():
+            if matched:
+                indicators.append(name)
+        return indicators
+
+    @classmethod
+    def _filter_relevant_cookies(cls, cookies: list[dict]) -> list[dict]:
+        return [
+            cookie for cookie in cookies
+            if cls._FETCH_COOKIE_RELEVANT_RE.search(cookie.get("name") or "")
+            or cls._FETCH_COOKIE_RELEVANT_RE.search(cookie.get("domain") or "")
+        ]
+
+    async def _capture_fetch_failure_artifacts(
+        self,
+        *,
+        page: Page,
+        request: Request,
+        pre_state: dict,
+        post_state: dict,
+        hdrs: dict,
+        err_name: str,
+        err_msg: str,
+        err_stack: Optional[str],
+        elapsed: float,
+    ) -> Optional[pathlib.Path]:
+        if not self._fetch_failure_artifacts_enabled:
+            return None
+
+        artifact_dir = self._fetch_failure_artifacts_dir / f"fetch_failure_{int(time() * 1000)}"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        screenshot_path = artifact_dir / "page.png"
+        html_path = artifact_dir / "page.html"
+        metadata_path = artifact_dir / "metadata.json"
+
+        html = None
+        try:
+            await page.screenshot(path=str(screenshot_path), full_page=True)
+        except Exception as exc:
+            logger.debug("[Fetch] Failed to capture screenshot for %s: %s", request.url, exc)
+        try:
+            html = await page.content()
+            html_path.write_text(html, encoding="utf-8")
+        except Exception as exc:
+            logger.debug("[Fetch] Failed to capture HTML for %s: %s", request.url, exc)
+
+        metadata = {
+            "request": {
+                "url": request.url,
+                "method": request.method,
+                "headers": hdrs,
+                "credentials": request.meta.get("playwright_fetch_credentials", "include"),
+                "meta": {
+                    "playwright_context": request.meta.get("playwright_context"),
+                    "playwright_fetch_seed_url": request.meta.get("playwright_fetch_seed_url"),
+                    "listing_type": request.meta.get("listing_type"),
+                    "business": request.meta.get("business"),
+                    "state": request.meta.get("state"),
+                    "city": request.meta.get("city"),
+                    "neighborhood": request.meta.get("neighborhood"),
+                },
+            },
+            "error": {
+                "name": err_name,
+                "message": err_msg,
+                "stack": err_stack,
+                "elapsed": elapsed,
+            },
+            "page": {
+                "final_url": post_state.get("page_url") or pre_state.get("page_url"),
+                "block_indicators": self._detect_block_indicators(
+                    text=html or "",
+                    headers={},
+                    page_url=post_state.get("page_url") or pre_state.get("page_url"),
+                ),
+            },
+            "cookies": {
+                "pre_context": self._filter_relevant_cookies(pre_state.get("context_cookies", [])),
+                "pre_for_url": self._filter_relevant_cookies(pre_state.get("cookies_for_url", [])),
+                "post_context": self._filter_relevant_cookies(post_state.get("context_cookies", [])),
+                "post_for_url": self._filter_relevant_cookies(post_state.get("cookies_for_url", [])),
+            },
+            "storage": {
+                "pre": pre_state.get("storage", {}),
+                "post": post_state.get("storage", {}),
+            },
+            "artifacts": {
+                "screenshot": screenshot_path.name if screenshot_path.exists() else None,
+                "html": html_path.name if html_path.exists() else None,
+            },
+        }
+        metadata_path.write_text(
+            _json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return artifact_dir
 
     async def download_with_fetch(
         self, request: Request, spider: Spider,
@@ -800,40 +1233,178 @@ class PlaywrightEngine:
         """Execute *request* as a ``fetch()`` call inside the browser."""
         start_time = time()
         page = await self.get_or_create_fetch_page(request, spider)
+        credentials_mode = request.meta.get("playwright_fetch_credentials", "include")
+        if credentials_mode not in {"include", "same-origin", "omit"}:
+            logger.warning(
+                "[Fetch] Invalid credentials mode %r for %s; falling back to 'include'",
+                credentials_mode,
+                request.url,
+            )
+            credentials_mode = "include"
 
         hdrs: dict = {}
         for key, values in request.headers.items():
             name = key.decode("utf-8") if isinstance(key, bytes) else key
-            val = values[-1] if isinstance(values, list) else values
-            hdrs[name] = val.decode("utf-8") if isinstance(val, bytes) else val
+            val = self._header_value_to_str(values)
+            if val is not None:
+                hdrs[name] = val
         hdrs = self._sanitize_fetch_headers(hdrs)
 
         body_str: Optional[str] = None
         if request.body:
             body_str = request.body.decode(request.encoding)
+        body_size = len(request.body or b"")
+
+        pre_state = await self._describe_fetch_state(page, request.url)
 
         js_code = self.build_fetch_js(
-            url=request.url, method=request.method, headers=hdrs, body=body_str,
+            url=request.url,
+            method=request.method,
+            headers=hdrs,
+            body=body_str,
+            credentials=credentials_mode,
         )
-        logger.info("[Fetch] %s %s", request.method, request.url)
+        cookie_names = [c["name"] for c in pre_state["cookies_for_url"]]
+        logger.info(
+            "[Fetch] -> %s %s page=%s cross_origin=%s credentials=%s headers=%d body=%dB "
+            "ctx_cookies=%s cookies_for_url=%d (%s) doc_cookie_len=%s",
+            request.method, request.url,
+            pre_state["page_url"], pre_state["cross_origin"], credentials_mode,
+            len(hdrs), body_size,
+            pre_state["context_cookie_count"],
+            len(cookie_names), ",".join(cookie_names) or "-",
+            pre_state["document_cookie_len"],
+        )
+        if pre_state["cross_origin"] and credentials_mode == "include":
+            logger.warning(
+                "[Fetch] Cross-origin request is using credentials='include' for %s; "
+                "this requires Access-Control-Allow-Credentials: true",
+                request.url,
+            )
+        logger.debug(
+            "[Fetch] Request headers after sanitize (%d): %s",
+            len(hdrs), hdrs,
+        )
+        logger.debug(
+            "[Fetch] Cookies that would be attached to %s: %s",
+            request.url, pre_state["cookies_for_url"],
+        )
+        # Full context jar — when ``cookies_for_url`` comes back empty but the
+        # context has cookies, this is what tells us whether the right ones
+        # exist but got partitioned/scope-filtered (Firefox ETP / Total Cookie
+        # Protection / SameSite) vs. genuinely never being set.
+        logger.debug(
+            "[Fetch] Full context cookie jar (%d): %s",
+            pre_state["context_cookie_count"] or 0,
+            pre_state["context_cookies"],
+        )
+        logger.debug(
+            "[Fetch] Relevant storage keys before request: %s",
+            pre_state.get("storage"),
+        )
+
         result = await page.evaluate(js_code)
+        elapsed = time() - start_time
+
+        if not result.get("ok", True):
+            # The in-page fetch() threw before producing a Response. Surface
+            # the actual browser-side error rather than letting Playwright's
+            # generic "NetworkError when attempting to fetch resource" mask it.
+            err_name = result.get("errorName", "UnknownError")
+            err_msg = result.get("errorMessage", "")
+            err_stack = result.get("errorStack")
+            post_state = await self._describe_fetch_state(page, request.url)
+            logger.error(
+                "[Fetch] <- THROW %s %s name=%s message=%s elapsed=%.3fs "
+                "page=%s ctx_cookies=%s cookies_for_url=%d",
+                request.method, request.url,
+                err_name, err_msg, elapsed,
+                post_state["page_url"], post_state["context_cookie_count"],
+                len(post_state["cookies_for_url"]),
+            )
+            if err_stack:
+                logger.debug("[Fetch] In-page error stack: %s", err_stack)
+            artifact_dir = await self._capture_fetch_failure_artifacts(
+                page=page,
+                request=request,
+                pre_state=pre_state,
+                post_state=post_state,
+                hdrs=hdrs,
+                err_name=err_name,
+                err_msg=err_msg,
+                err_stack=err_stack,
+                elapsed=elapsed,
+            )
+            logger.error(
+                "[Fetch] Failure diagnostics url=%s page=%s relevant_cookies=%s storage=%s artifacts=%s",
+                request.url,
+                post_state.get("page_url"),
+                self._filter_relevant_cookies(post_state.get("context_cookies", [])),
+                post_state.get("storage"),
+                str(artifact_dir) if artifact_dir else "disabled",
+            )
+            self._inc_stat("playwright/fetch_error_count")
+            self._inc_stat(f"playwright/fetch_error/{err_name}")
+            raise RuntimeError(
+                f"playwright_fetch: in-page fetch() threw {err_name}: {err_msg} "
+                f"(url={request.url})"
+            )
 
         status = result["status"]
-        resp_headers = Headers(result.get("headers") or {})
+        resp_headers_raw = result.get("headers") or {}
+        content_encoding = (
+            resp_headers_raw.get("content-encoding")
+            or resp_headers_raw.get("Content-Encoding")
+        )
+        set_cookie_raw = (
+            resp_headers_raw.get("set-cookie")
+            or resp_headers_raw.get("Set-Cookie")
+            or ""
+        )
+        # Set-Cookie values come back joined by ", " in fetch() — best-effort
+        # split on cookie boundaries (commas inside Expires=... attr would
+        # confuse a naive split; this is only for diagnostic logging).
+        set_cookie_names = [
+            piece.split("=", 1)[0].strip()
+            for piece in set_cookie_raw.split("\n")
+            if "=" in piece
+        ] if set_cookie_raw else []
+
+        logger.info(
+            "[Fetch] <- %s %s status=%s type=%s redirected=%s finalUrl=%s "
+            "elapsed=%.3fs body=%dB resp_headers=%d enc=%s set_cookie=%s",
+            request.method, request.url,
+            status, result.get("type"), result.get("redirected"),
+            result.get("finalUrl"), elapsed,
+            len(result.get("body", "") or ""), len(resp_headers_raw),
+            content_encoding or "-",
+            ",".join(set_cookie_names) or "-",
+        )
+        logger.debug(
+            "[Fetch] In-page fetch() resolved: statusText=%r headers=%s",
+            result.get("statusText"), resp_headers_raw,
+        )
+        if result.get("bodyError"):
+            logger.warning(
+                "[Fetch] response.text() failed for %s: %s",
+                request.url, result["bodyError"],
+            )
+        resp_headers = Headers(resp_headers_raw)
         resp_headers.pop("Content-Encoding", None)
         resp_body_text = result.get("body", "")
         body_bytes, encoding = _encode_body(headers=resp_headers, text=resp_body_text)
-        request.meta["download_latency"] = time() - start_time
+        request.meta["download_latency"] = elapsed
         self._emit_signal(
             pw_signals.fetch_executed,
             url=request.url,
             method=request.method,
             status=status,
-            duration=request.meta["download_latency"],
+            duration=elapsed,
         )
 
         respcls = responsetypes.from_args(headers=resp_headers, url=request.url, body=body_bytes)
         self._inc_stat("playwright/fetch_count")
+        self._inc_stat(f"playwright/fetch_status/{status // 100}xx")
         return respcls(
             url=request.url,
             status=status,
@@ -920,7 +1491,18 @@ class PlaywrightEngine:
         if download and download.exception:
             raise download.exception
 
-        if not request.meta.get("playwright_include_page"):
+        if request.meta.get("playwright_include_page"):
+            context_name = request.meta.get("playwright_context", DEFAULT_CONTEXT_NAME)
+            pw_ctx = self.contexts.get(context_name)
+            if pw_ctx is not None:
+                pw_ctx.retain_page(page)
+                logger.debug(
+                    "[Lifecycle] Retained page for response "
+                    "(context='%s', url=%s)",
+                    context_name,
+                    page.url,
+                )
+        else:
             await self.return_or_close_page(request, page)
 
         if download:
@@ -1076,8 +1658,9 @@ class PlaywrightEngine:
                     merged = dict(final_headers)
                     for key, values in headers.items():
                         name = key.decode("utf-8") if isinstance(key, bytes) else key
-                        val = values[-1] if isinstance(values, list) else values
-                        merged[name.lower()] = val.decode("utf-8") if isinstance(val, bytes) else val
+                        val = self._header_value_to_str(values)
+                        if val is not None:
+                            merged[name.lower()] = val
                     overrides["headers"] = merged
                     final_headers = merged
                 headers.clear()
@@ -1110,10 +1693,13 @@ class PlaywrightEngine:
         if self._cf_bypass is not None and CloudflareDiagnostics.should_log_network_event(response.request):
             asyncio.create_task(self._cf_bypass._diagnostics.log_response_event(response))
 
-    def _make_close_page_cb(self, context_name: str) -> Callable:
-        def cb() -> None:
+    def _make_close_page_cb(
+        self, context_name: str, tracked_page: Optional[Page] = None
+    ) -> Callable:
+        def cb(page: Optional[Page] = None) -> None:
             pw_ctx = self.contexts.get(context_name)
             if pw_ctx is not None:
+                pw_ctx.forget_page(page or tracked_page)
                 pw_ctx.pool._semaphore.release()
         return cb
 
@@ -1220,6 +1806,48 @@ def _make_response_logger(context_name: str, spider: Spider) -> Callable:
             log_msg = "[Context=%s] Response: <%i %s>"
         logger.debug(log_msg, *log_args)
     return _log_response
+
+
+def _make_requestfailed_logger(context_name: str) -> Callable:
+    """Log every Camoufox/Firefox-level request failure (DNS, TLS, CORS abort,
+    NS_ERROR_*, NS_BINDING_ABORTED, etc.) — these never surface as an exception
+    in Playwright's `page.evaluate`/`fetch()` flow on their own."""
+    def _log_requestfailed(request: PlaywrightRequest) -> None:
+        failure = getattr(request, "failure", None)
+        logger.error(
+            "[Context=%s] RequestFailed: <%s %s> resource_type=%s failure=%s",
+            context_name, request.method, request.url, request.resource_type, failure,
+        )
+    return _log_requestfailed
+
+
+def _make_console_logger(context_name: str) -> Callable:
+    """Forward browser console messages into Python logs — Firefox prints CORS
+    rejections, mixed-content blocks, and CSP violations to the console even
+    when fetch() raises a generic NetworkError."""
+    def _log_console(message) -> None:
+        try:
+            level = (message.type or "").lower()
+            text = message.text
+        except Exception:
+            level, text = "log", str(message)
+        py_level = {
+            "error": logging.ERROR,
+            "warning": logging.WARNING,
+            "warn": logging.WARNING,
+            "info": logging.INFO,
+            "debug": logging.DEBUG,
+        }.get(level, logging.INFO)
+        logger.log(py_level, "[Context=%s] Console[%s]: %s", context_name, level or "log", text)
+    return _log_console
+
+
+def _make_pageerror_logger(context_name: str) -> Callable:
+    """Log uncaught JS errors emitted by the page (helps when an in-page fetch
+    chain throws before/after our wrapped try/catch)."""
+    def _log_pageerror(error) -> None:
+        logger.error("[Context=%s] PageError: %s", context_name, error)
+    return _log_pageerror
 
 
 # Back-compat alias — external code may import this name.

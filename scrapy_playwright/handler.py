@@ -82,6 +82,11 @@ class Config:
     cf_seed_url: Optional[str] = None
     cf_seed_timeout: int = 90_000
     cf_wait_timeout: int = 60_000
+    antibot_remediation_enabled: bool = False
+    antibot_remediation_actions: Optional[list] = None
+    profile_rotation_archive_dir: Optional[str] = None
+    fetch_failure_artifacts_enabled: bool = False
+    fetch_failure_artifacts_dir: str = "playwright_fetch_failures"
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "Config":
@@ -129,6 +134,25 @@ class Config:
             cf_seed_url=settings.get("PLAYWRIGHT_CLOUDFLARE_SEED_URL"),
             cf_seed_timeout=settings.getint("PLAYWRIGHT_CLOUDFLARE_SEED_TIMEOUT", 90_000),
             cf_wait_timeout=settings.getint("PLAYWRIGHT_CLOUDFLARE_WAIT_TIMEOUT", 60_000),
+            antibot_remediation_enabled=settings.getbool(
+                "PLAYWRIGHT_ANTIBOT_REMEDIATION_ENABLED",
+                default=settings.getbool("PLAYWRIGHT_CLOUDFLARE_CHALLENGE_RETRY", default=False),
+            ),
+            antibot_remediation_actions=settings.getlist(
+                "PLAYWRIGHT_ANTIBOT_REMEDIATION_ACTIONS",
+                ["profile_rotation"],
+            ),
+            profile_rotation_archive_dir=settings.get("PLAYWRIGHT_PROFILE_ROTATION_ARCHIVE_DIR"),
+            fetch_failure_artifacts_enabled=settings.getbool(
+                "PLAYWRIGHT_FETCH_FAILURE_ARTIFACTS_ENABLED", default=False
+            ),
+            fetch_failure_artifacts_dir=settings.get(
+                "PLAYWRIGHT_FETCH_FAILURE_ARTIFACTS_DIR",
+                os.path.join(
+                    settings.get("OUTPUT_DIRECTORY", "output"),
+                    "playwright_fetch_failures",
+                ),
+            ),
         )
         cfg.cdp_kwargs.pop("endpoint_url", None)
         cfg.connect_kwargs.pop("ws_endpoint", None)
@@ -220,6 +244,11 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                 cf_seed_url=self.config.cf_seed_url,
                 cf_seed_timeout=self.config.cf_seed_timeout,
                 cf_wait_timeout=self.config.cf_wait_timeout,
+                antibot_remediation_enabled=self.config.antibot_remediation_enabled,
+                antibot_remediation_actions=self.config.antibot_remediation_actions,
+                profile_rotation_archive_dir=self.config.profile_rotation_archive_dir,
+                fetch_failure_artifacts_enabled=self.config.fetch_failure_artifacts_enabled,
+                fetch_failure_artifacts_dir=pathlib.Path(self.config.fetch_failure_artifacts_dir),
                 signal_dispatcher=self._emit_signal,
             )
             pw.on_stats_inc = self.stats.inc_value

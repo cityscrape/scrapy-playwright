@@ -14,6 +14,7 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 from scrapy import Spider, Request, FormRequest
+from scrapy.http.headers import Headers
 
 from scrapy_playwright.handler import DEFAULT_CONTEXT_NAME, _SCRAPY_ASYNC_API
 from scrapy_playwright.page import PageMethod
@@ -193,6 +194,40 @@ class MixinTestCase:
             route.continue_.side_effect = PlaywrightError("qwerty")
             with pytest.raises(PlaywrightError):
                 await req_handler(route, playwright_request)
+
+    @allow_windows
+    async def test_route_handler_ignores_empty_scrapy_header_values(self):
+        async with make_handler({"PLAYWRIGHT_BROWSER_TYPE": self.browser_type}) as handler:
+            scrapy_headers = Headers({"Accept": "text/html"})
+            scrapy_headers[b"Sec-Fetch-Mode"] = []
+            scrapy_request = Request(
+                url="https://example.org",
+                method="GET",
+                headers=scrapy_headers,
+            )
+            initial_request_done = asyncio.Event()
+            req_handler = handler._make_request_handler(
+                context_name=DEFAULT_CONTEXT_NAME,
+                method=scrapy_request.method,
+                url=scrapy_request.url,
+                headers=scrapy_request.headers,
+                body=None,
+                encoding="utf-8",
+                spider=Spider("foo"),
+                initial_request_done=initial_request_done,
+            )
+            route = AsyncMock()
+            playwright_request = AsyncMock()
+            playwright_request.url = scrapy_request.url
+            playwright_request.method = scrapy_request.method
+            playwright_request.is_navigation_request = MagicMock(return_value=True)
+            playwright_request.all_headers.return_value = {"user-agent": "browser"}
+
+            await req_handler(route, playwright_request)
+
+            headers = route.continue_.call_args.kwargs["headers"]
+            assert headers["accept"] == "text/html"
+            assert "sec-fetch-mode" not in headers
 
     @allow_windows
     async def test_event_handler_dialog_callable(self):

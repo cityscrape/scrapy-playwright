@@ -23,7 +23,9 @@ from scrapy_playwright.cloudflare.types import (
     ContextChallengeInfo,
     ChallengeType,
     body_has_challenge_markers,
+    is_private_token_challenge_response,
 )
+from scrapy_playwright.cloudflare.remediation import RemediationInput
 from scrapy_playwright import signals as pw_signals
 
 if TYPE_CHECKING:
@@ -257,17 +259,11 @@ class CloudflareDiagnostics:
         try:
             headers = await response.all_headers()
             private_token_challenge = None
-            if (
-                response.status == 401
-                and "/cdn-cgi/challenge-platform/" in response.url
-                and "pat/" in response.url
-            ):
-                www_authenticate = headers.get("www-authenticate", "")
-                if "PrivateToken challenge=" in www_authenticate:
-                    private_token_challenge = {
-                        "url": response.url,
-                        "www_authenticate": www_authenticate,
-                    }
+            if is_private_token_challenge_response(response.url, response.status, headers):
+                private_token_challenge = {
+                    "url": response.url,
+                    "www_authenticate": headers.get("www-authenticate", ""),
+                }
             logger.info(
                 "[Cloudflare] Network response: method=%s resource_type=%s status=%s "
                 "url=%s server=%r cf-mitigated=%r set-cookie=%r headers=%s",
@@ -292,19 +288,39 @@ class CloudflareDiagnostics:
                 )
                 request = getattr(response, "request", None)
                 if request is not None:
-                    context_name = getattr(request.frame.page, "context", None)
+                    context = getattr(getattr(request.frame, "page", None), "context", None)
+                    context_name = self._engine.get_context_name_for_playwright_context(context)
+                    attrs = {
+                        "request": None,
+                        "url": request.url,
+                        "method": request.method,
+                        "mode": "page" if request.resource_type == "document" else request.resource_type,
+                        "context_name": context_name,
+                        "challenge_type": ChallengeType.PRIVATE_TOKEN.value,
+                        "status": response.status,
+                        "resp_url": response.url,
+                        "cf_mitigated": headers.get("cf-mitigated"),
+                    }
+                    self._engine._emit_signal(
+                        pw_signals.cloudflare_challenge_detected,
+                        **attrs,
+                    )
                     self._engine._emit_signal(
                         pw_signals.playwright_blocked,
-                        request=None,
-                        url=request.url,
-                        method=request.method,
-                        mode="page" if request.resource_type == "document" else request.resource_type,
-                        context_name=getattr(getattr(context_name, "_impl_obj", None), "_guid", "unknown"),
-                        challenge_type=ChallengeType.MANAGED_CHALLENGE.value,
+                        **attrs,
                         blocked_reason="private_token_challenge",
-                        status=response.status,
-                        resp_url=response.url,
-                        cf_mitigated=headers.get("cf-mitigated"),
+                    )
+                    await self._engine.remediate_antibot_block(
+                        RemediationInput(
+                            request=None,
+                            context_name=context_name,
+                            mode=attrs["mode"],
+                            challenge_type=ChallengeType.PRIVATE_TOKEN.value,
+                            blocked_reason="private_token_challenge",
+                            status=response.status,
+                            resp_url=response.url,
+                            source_event="private_token_network_response",
+                        )
                     )
                 logger.warning(
                     "[Cloudflare] PrivateToken challenge encountered at %s. "

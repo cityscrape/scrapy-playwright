@@ -64,6 +64,7 @@ MIME_TO_EXT = {
     "image/gif": ".gif",
     "image/svg+xml": ".svg",
     "image/webp": ".webp",
+    "x-playwright/request-failed": ".txt",
 }
 
 
@@ -106,10 +107,12 @@ def _is_api_call(entry: dict) -> bool:
 def _format_request_http(request: dict) -> str:
     method = request['method']
     url = request['url']
-    version = request.get('httpVersion', 'HTTP/1.1')
+    version = request.get('httpVersion')
 
     if version in ('h2', 'h3', 'http/2.0', 'HTTP/2'):
         version_display = version.upper()
+    elif version is None:
+        version_display = 'HTTP/UNKNOWN'
     elif not version.startswith('HTTP'):
         version_display = f'HTTP/{version}'
     else:
@@ -158,10 +161,12 @@ def _format_request_http(request: dict) -> str:
 def _format_response_http(response: dict, include_body: bool = False) -> str:
     status = response['status']
     status_text = response.get('statusText', '')
-    version = response.get('httpVersion', 'HTTP/1.1')
+    version = response.get('httpVersion')
 
     if version in ('h2', 'h3', 'http/2.0', 'HTTP/2'):
         version_display = version.upper()
+    elif version is None:
+        version_display = 'HTTP/UNKNOWN'
     elif not version.startswith('HTTP'):
         version_display = f'HTTP/{version}'
     else:
@@ -207,6 +212,7 @@ def _build_metadata(entry: dict, index: int) -> dict:
         'connection': entry.get('connection'),
         'resourceType': entry.get('_resourceType'),
         'priority': entry.get('_priority'),
+        'failureText': entry.get('_failureText'),
         'request': {
             'method': request['method'],
             'url': request['url'],
@@ -214,6 +220,7 @@ def _build_metadata(entry: dict, index: int) -> dict:
             'path': parsed_url.path,
             'queryString': {p['name']: p['value'] for p in request.get('queryString', [])},
             'httpVersion': request.get('httpVersion'),
+            'httpVersionSource': request.get('_httpVersionSource'),
             'headersSize': request.get('headersSize'),
             'bodySize': request.get('bodySize'),
             'cookieCount': len(request.get('cookies', [])),
@@ -226,6 +233,7 @@ def _build_metadata(entry: dict, index: int) -> dict:
             'status': response['status'],
             'statusText': response.get('statusText'),
             'httpVersion': response.get('httpVersion'),
+            'httpVersionSource': response.get('_httpVersionSource'),
             'mimeType': response['content'].get('mimeType'),
             'size': response['content'].get('size'),
             'headersSize': response.get('headersSize'),
@@ -276,6 +284,33 @@ def _extract_response_body(response: dict) -> tuple:
             pass
 
     return text, ext
+
+
+def _get_playwright_http_version(obj) -> tuple[Optional[str], str]:
+    """Best-effort protocol extraction from Playwright objects.
+
+    Playwright's public Python Request/Response API does not expose the HTTP
+    protocol version. Some browser backends may carry it in internal
+    initializer fields, so use those when present and otherwise leave the value
+    unknown instead of hardcoding HTTP/1.1.
+    """
+    for attr in ("http_version", "httpVersion", "protocol"):
+        value = getattr(obj, attr, None)
+        if callable(value):
+            with suppress(Exception):
+                value = value()
+        if value:
+            return str(value), f"playwright.{attr}"
+
+    impl = getattr(obj, "_impl_obj", None)
+    initializer = getattr(impl, "_initializer", None)
+    if isinstance(initializer, dict):
+        for key in ("httpVersion", "http_version", "protocol"):
+            value = initializer.get(key)
+            if value:
+                return str(value), f"playwright._initializer.{key}"
+
+    return None, "not_exposed_by_playwright"
 
 
 # ── Cookie parsing helpers ─────────────────────────────────────────────────
@@ -380,12 +415,128 @@ class NetworkRecorder:
                 "Failed to write HAR entry %d for %s", index, url, exc_info=True,
             )
 
+    async def on_request_failed(self, request: PlaywrightRequest) -> None:
+        """Playwright page "requestfailed" event handler.
+
+        Failed browser requests do not emit a response event, so recording only
+        responses drops the exact requests we need when fetch() fails before an
+        HTTP response is exposed to page JavaScript.
+        """
+        url = request.url
+        if self._url_filter and not self._url_filter.search(url):
+            return
+
+        try:
+            entry = await self._build_failed_har_entry(request)
+        except Exception:
+            logger.debug(
+                "Failed to build failed HAR entry for %s", url, exc_info=True,
+            )
+            return
+
+        index = self._counter
+        self._counter += 1
+
+        try:
+            self._write_entry(entry, index)
+        except Exception:
+            logger.debug(
+                "Failed to write failed HAR entry %d for %s", index, url, exc_info=True,
+            )
+
     # ── Build HAR-format entry from Playwright objects ─────────────────
+
+    async def _build_failed_har_entry(
+            self, pw_request: PlaywrightRequest,
+    ) -> dict:
+        req_headers = await pw_request.headers_array()
+        req_http_version, req_http_version_source = _get_playwright_http_version(pw_request)
+
+        parsed = urlparse(pw_request.url)
+        query_params = []
+        if parsed.query:
+            for part in parsed.query.split('&'):
+                if '=' in part:
+                    k, _, v = part.partition('=')
+                    query_params.append({'name': k, 'value': v})
+                else:
+                    query_params.append({'name': part, 'value': ''})
+
+        post_data_dict = None
+        post_data_text = pw_request.post_data
+        if post_data_text is not None:
+            req_ct = ''
+            for h in req_headers:
+                if h['name'].lower() == 'content-type':
+                    req_ct = h['value']
+                    break
+            post_data_dict = {
+                'mimeType': req_ct,
+                'text': post_data_text,
+            }
+
+        req_cookies = _parse_request_cookies(req_headers)
+
+        sizes = {}
+        with suppress(Exception):
+            sizes = await pw_request.sizes()
+
+        timing = None
+        with suppress(Exception):
+            timing = pw_request.timing
+
+        failure = None
+        with suppress(Exception):
+            failure = pw_request.failure
+            if callable(failure):
+                failure = failure()
+
+        entry = {
+            'startedDateTime': datetime.now(timezone.utc).isoformat(),
+            'time': timing.get('responseEnd', 0) if timing else 0,
+            'serverIPAddress': None,
+            '_resourceType': pw_request.resource_type,
+            '_failureText': failure,
+            'request': {
+                'method': pw_request.method,
+                'url': pw_request.url,
+                'httpVersion': req_http_version,
+                '_httpVersionSource': req_http_version_source,
+                'headers': req_headers,
+                'queryString': query_params,
+                'cookies': req_cookies,
+                'headersSize': sizes.get('requestHeadersSize', -1),
+                'bodySize': sizes.get('requestBodySize', -1),
+            },
+            'response': {
+                'status': 0,
+                'statusText': 'REQUEST_FAILED',
+                'httpVersion': None,
+                '_httpVersionSource': 'no_response_for_failed_request',
+                'headers': [],
+                'cookies': [],
+                'content': {
+                    'size': 0,
+                    'mimeType': 'x-playwright/request-failed',
+                    'text': failure or '',
+                },
+                'headersSize': -1,
+                'bodySize': 0,
+            },
+            'timings': timing,
+        }
+
+        if post_data_dict:
+            entry['request']['postData'] = post_data_dict
+
+        return entry
 
     async def _build_har_entry(
             self, response: PlaywrightResponse,
     ) -> dict:
         pw_request = response.request
+        req_http_version, req_http_version_source = _get_playwright_http_version(pw_request)
+        resp_http_version, resp_http_version_source = _get_playwright_http_version(response)
 
         # Headers — headers_array() returns [{name, value}] matching HAR format
         req_headers = await pw_request.headers_array()
@@ -482,7 +633,8 @@ class NetworkRecorder:
             'request': {
                 'method': pw_request.method,
                 'url': pw_request.url,
-                'httpVersion': 'HTTP/1.1',
+                'httpVersion': req_http_version,
+                '_httpVersionSource': req_http_version_source,
                 'headers': req_headers,
                 'queryString': query_params,
                 'cookies': req_cookies,
@@ -492,7 +644,8 @@ class NetworkRecorder:
             'response': {
                 'status': response.status,
                 'statusText': response.status_text,
-                'httpVersion': 'HTTP/1.1',
+                'httpVersion': resp_http_version,
+                '_httpVersionSource': resp_http_version_source,
                 'headers': resp_headers,
                 'cookies': resp_cookies,
                 'content': {

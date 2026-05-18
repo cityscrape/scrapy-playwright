@@ -6,6 +6,7 @@ from scrapy.http import HtmlResponse
 
 from scrapy_playwright.cloudflare.bypass import CloudflareBypass
 from scrapy_playwright.cloudflare.gate import CfGate
+from scrapy_playwright.cloudflare.types import ChallengeType, classify_challenge
 from scrapy_playwright import signals as pw_signals
 
 
@@ -25,6 +26,9 @@ class _FakeEngine:
 
     def _sanitize_for_log(self, value):
         return value
+
+    async def remediate_antibot_block(self, event):
+        self.events.append(("remediate", event))
 
 
 class TestCloudflareSignals(IsolatedAsyncioTestCase):
@@ -51,6 +55,39 @@ class TestCloudflareSignals(IsolatedAsyncioTestCase):
         self.assertIs(result, response)
         assert engine.events[0][0] is pw_signals.playwright_blocked
         assert engine.events[0][1]["blocked_reason"] == "cloudflare_plain_403"
+
+    async def test_private_token_emits_challenge_and_terminal_block(self):
+        engine = _FakeEngine()
+        bypass = CloudflareBypass(engine=engine)
+        request = Request("https://example.com/listings", meta={"playwright_context": "cf"})
+        response = HtmlResponse(
+            url="https://example.com/cdn-cgi/challenge-platform/h/b/pat/abc",
+            request=request,
+            status=401,
+            headers={
+                b"Server": b"cloudflare",
+                b"WWW-Authenticate": b'PrivateToken challenge="abc"',
+            },
+            body=b"",
+        )
+
+        result = await bypass.handle_if_challenged(
+            request,
+            response,
+            Spider("test"),
+            "cf",
+            dispatch_fn=AsyncMock(),
+        )
+
+        self.assertIs(result, response)
+        assert classify_challenge(response) == ChallengeType.PRIVATE_TOKEN
+        signals = [signal for signal, _ in engine.events if signal != "remediate"]
+        assert signals[0] is pw_signals.cloudflare_challenge_detected
+        assert signals[1] is pw_signals.playwright_blocked
+        assert engine.events[0][1]["challenge_type"] == "private_token"
+        assert engine.events[1][1]["blocked_reason"] == "private_token_challenge"
+        assert engine.events[2][0] == "remediate"
+        assert engine.events[2][1].challenge_type == "private_token"
 
     async def test_turnstile_solve_emits_detected_and_solve_events(self):
         engine = _FakeEngine()

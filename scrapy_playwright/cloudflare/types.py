@@ -19,6 +19,7 @@ class ChallengeType(enum.Enum):
     NONE = "none"
     JS_CHALLENGE = "js_challenge"
     MANAGED_CHALLENGE = "managed_challenge"
+    PRIVATE_TOKEN = "private_token"
     TURNSTILE = "turnstile"
     PLAIN_403 = "plain_403"
 
@@ -84,6 +85,9 @@ def classify_challenge(response) -> ChallengeType:
     if not server.lower().startswith("cloudflare"):
         return ChallengeType.NONE
 
+    if is_private_token_challenge_response(response.url, response.status, response.headers):
+        return ChallengeType.PRIVATE_TOKEN
+
     if response.status not in (403, 429, 503):
         return ChallengeType.NONE
 
@@ -128,6 +132,26 @@ def classify_challenge(response) -> ChallengeType:
         return ChallengeType.PLAIN_403
 
     return ChallengeType.NONE
+
+
+def is_private_token_challenge_response(url: str, status: int, headers: dict) -> bool:
+    """Return True when response metadata matches a Cloudflare PAT challenge."""
+    if status != 401:
+        return False
+    if "/cdn-cgi/challenge-platform/" not in url or "pat/" not in url:
+        return False
+
+    www_authenticate = None
+    for key, value in headers.items():
+        key_str = key.decode("utf-8", errors="replace") if isinstance(key, bytes) else str(key)
+        if key_str.lower() == "www-authenticate":
+            www_authenticate = value
+            break
+    if isinstance(www_authenticate, list):
+        www_authenticate = www_authenticate[0] if www_authenticate else None
+    if isinstance(www_authenticate, bytes):
+        www_authenticate = www_authenticate.decode("utf-8", errors="replace")
+    return bool(www_authenticate and "PrivateToken challenge=" in str(www_authenticate))
 
 
 def resolve_first_party_url(

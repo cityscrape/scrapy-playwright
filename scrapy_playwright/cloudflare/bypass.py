@@ -26,6 +26,7 @@ from scrapy_playwright.cloudflare.types import (
     has_cf_clearance,
     resolve_first_party_url,
 )
+from scrapy_playwright.cloudflare.remediation import RemediationInput
 from scrapy_playwright.cloudflare.diagnostics import CloudflareDiagnostics
 from scrapy_playwright import signals as pw_signals
 
@@ -121,6 +122,22 @@ class CloudflareBypass:
             attrs["validated_url"] = validated_url
         return attrs
 
+    async def _emit_blocked_and_remediate(self, **attrs) -> None:
+        self._engine._emit_signal(pw_signals.playwright_blocked, **attrs)
+        await self._engine.remediate_antibot_block(
+            RemediationInput(
+                request=attrs.get("request"),
+                context_name=attrs.get("context_name", "default"),
+                mode=attrs.get("mode", "page"),
+                challenge_type=attrs.get("challenge_type"),
+                blocked_reason=attrs.get("blocked_reason"),
+                status=attrs.get("status"),
+                resp_url=attrs.get("resp_url"),
+                attempt_count=attrs.get("attempt_count"),
+                error_type=attrs.get("error_type"),
+            )
+        )
+
     # ── Public API used by the engine ──────────────────────────────────
 
     async def wait_if_solving(self, context_name: str, request: Request) -> None:
@@ -146,14 +163,33 @@ class CloudflareBypass:
         if challenge_type == ChallengeType.NONE:
             return response
         if challenge_type == ChallengeType.PLAIN_403:
-            self._engine._emit_signal(
-                pw_signals.playwright_blocked,
+            await self._emit_blocked_and_remediate(
                 **self._event_attrs(
                     request,
                     context_name=context_name,
                     challenge_type=challenge_type,
                     response=response,
                     blocked_reason="cloudflare_plain_403",
+                ),
+            )
+            return response
+        if challenge_type == ChallengeType.PRIVATE_TOKEN:
+            self._engine._emit_signal(
+                pw_signals.cloudflare_challenge_detected,
+                **self._event_attrs(
+                    request,
+                    context_name=context_name,
+                    challenge_type=challenge_type,
+                    response=response,
+                ),
+            )
+            await self._emit_blocked_and_remediate(
+                **self._event_attrs(
+                    request,
+                    context_name=context_name,
+                    challenge_type=challenge_type,
+                    response=response,
+                    blocked_reason="private_token_challenge",
                 ),
             )
             return response
@@ -263,8 +299,7 @@ class CloudflareBypass:
             info.state = ChallengeState.FAILED
             if info.solve_event:
                 info.solve_event.set()
-            self._engine._emit_signal(
-                pw_signals.playwright_blocked,
+            await self._emit_blocked_and_remediate(
                 **self._event_attrs(
                     request,
                     context_name=context_name,
@@ -369,8 +404,7 @@ class CloudflareBypass:
         if info.state == ChallengeState.VALIDATED:
             await asyncio.sleep(1.0 + (0.5 * info.attempt_count))
             return await dispatch_fn(request, spider)
-        self._engine._emit_signal(
-            pw_signals.playwright_blocked,
+        await self._emit_blocked_and_remediate(
             **self._event_attrs(
                 request,
                 context_name=context_name,
@@ -410,8 +444,8 @@ class CloudflareBypass:
                 page, page_is_new = await pw_ctx.acquire_page()
                 if page_is_new:
                     self._engine._inc_stat("playwright/page_count")
-                    page.on("close", self._engine._make_close_page_cb(pw_ctx.name))
-                    page.on("crash", self._engine._make_close_page_cb(pw_ctx.name))
+                    page.on("close", self._engine._make_close_page_cb(pw_ctx.name, page))
+                    page.on("crash", self._engine._make_close_page_cb(pw_ctx.name, page))
             info.carrier_page = page
 
         solve_url = resolve_first_party_url(request, self._seed_url)

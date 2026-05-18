@@ -285,3 +285,52 @@ Keyword arguments:
 * ``attempt_count``   — solve attempt number when applicable.
 * ``error_type``      — exception class name when applicable.
 """
+
+antibot_remediation_selected = object()
+"""Fired after an anti-bot remediation action is selected.
+
+Keyword arguments:
+* ``request``         — originating Scrapy request when available.
+* ``action``          — remediation action name.
+* ``context_name``    — logical context name.
+* ``challenge_type``  — challenge classification when known.
+* ``blocked_reason``  — normalized blocked reason.
+* ``source_event``    — source signal/event that requested remediation.
+"""
+
+antibot_remediation_started = object()
+"""Fired when an anti-bot remediation action starts.
+
+Keyword arguments are the same as ``antibot_remediation_selected``.
+"""
+
+antibot_remediation_completed = object()
+"""Fired when an anti-bot remediation action completes.
+
+Keyword arguments:
+* ``action``       — remediation action name.
+* ``outcome``      — terminal action outcome.
+* ``duration``     — action duration in seconds.
+* ``profile_dir``  — profile path affected by the action, for logs/traces.
+* ``archive_path`` — archive path created by the action, for logs/traces.
+"""
+
+antibot_remediation_skipped = object()
+"""Fired when remediation is not run.
+
+Keyword arguments:
+* ``action``       — candidate action when known.
+* ``outcome``      — normally ``"skipped"``.
+* ``skip_reason``  — low-cardinality reason string.
+"""
+
+antibot_remediation_failed = object()
+"""Fired when remediation action execution fails.
+
+Keyword arguments:
+* ``action``         — remediation action name.
+* ``outcome``        — normally ``"failed"``.
+* ``failure_reason`` — low-cardinality failure reason.
+* ``error_type``     — exception class name.
+* ``duration``       — action duration in seconds.
+"""
