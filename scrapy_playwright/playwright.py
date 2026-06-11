@@ -18,7 +18,7 @@ from time import time
 from typing import Callable, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
-from playwright._impl._errors import TargetClosedError
+from playwright._impl._errors import TargetClosedError, TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import (
     Browser,
     BrowserContext,
@@ -39,8 +39,10 @@ from scrapy.responsetypes import responsetypes
 from scrapy.utils.misc import load_object
 
 from scrapy_playwright import signals as pw_signals
+from scrapy_playwright.headers import use_scrapy_headers
 from scrapy_playwright.network_recorder import NetworkRecorder
 from scrapy_playwright.page import PageMethod, PagePool, POOL_STRATEGY_REUSE_FIRST
+from scrapy_playwright.tiling import WindowTilingManager, Rect
 from scrapy_playwright._utils import (
     _encode_body,
     _get_header_value,
@@ -106,6 +108,12 @@ class PlaywrightContext:
         self.recorder = recorder
         self._navigation_timeout = navigation_timeout
         self._retained_pages: set[Page] = set()
+        # Serializes use of the shared retained "carrier" page: only one
+        # ``fetch()`` (and its seed navigation) may drive that page at a time.
+        # Without this, concurrent ``playwright_fetch`` requests race the same
+        # page — one issuing ``page.goto(seed)`` while another is mid-fetch —
+        # which surfaces as ``Page.goto: Timeout 30000ms exceeded``.
+        self.fetch_lock = asyncio.Lock()
 
         self.pool = PagePool(
             max_pages,
@@ -183,6 +191,11 @@ class PlaywrightEngine:
         close_page_after_request: bool = False,
         pool_strategy: str = POOL_STRATEGY_REUSE_FIRST,
         stealth_init_scripts: Optional[list] = None,
+        tiling_enabled: bool = False,
+        tiling_screen_width: Optional[int] = None,
+        tiling_screen_height: Optional[int] = None,
+        tiling_margin: int = 0,
+        tiling_adjust_viewport: bool = True,
         har_recording: bool = False,
         har_output_dir: pathlib.Path = pathlib.Path("har_recordings"),
         har_url_filter: Optional[str] = None,
@@ -223,6 +236,27 @@ class PlaywrightEngine:
         self._pool_strategy = pool_strategy
         self._stealth_init_scripts = stealth_init_scripts
         self._restart_disconnected_browser = restart_disconnected_browser
+
+        # Tiling
+        self._tiling_enabled = tiling_enabled
+        self._tiling_manager: Optional[WindowTilingManager] = None
+        if self._tiling_enabled and not self._launch_options.get("headless", False) and not self._camoufox_options.get("headless", False):
+            self._tiling_manager = WindowTilingManager(
+                pool_size=self._max_pages_per_context * (self._max_contexts or 1),
+                screen_width=tiling_screen_width,
+                screen_height=tiling_screen_height,
+                margin=tiling_margin,
+                adjust_viewport=tiling_adjust_viewport,
+            )
+
+        # Carrier-page seeding (fetch mode). A Cloudflare interstitial can hang
+        # the seed ``page.goto`` for the full timeout; retry a bounded number of
+        # times with a short backoff instead of dropping the request.
+        self._fetch_seed_timeout_ms = int(
+            navigation_timeout if navigation_timeout else 45_000
+        )
+        self._fetch_seed_max_attempts = 2
+        self._fetch_seed_retry_delay_s = 1.5
 
         # HAR
         self._har_recording = har_recording
@@ -274,6 +308,9 @@ class PlaywrightEngine:
             )
         else:
             self._cf_bypass = None
+        # Set by the handler after construction; lets the bypass re-close the
+        # serialization gate when a post-clearance challenge is observed.
+        self._cf_gate = None
         self._remediation = RemediationManager(
             engine=self,
             enabled=antibot_remediation_enabled,
@@ -427,6 +464,12 @@ class PlaywrightEngine:
                 return
             logger.info("[Lifecycle] restart ENTER")
             self.contexts.clear()
+            # A restart drops all in-memory contexts (and their warmed carrier
+            # pages). Re-close the serialization gate so the next requests
+            # re-serialize and re-warm the fresh context one at a time instead
+            # of stampeding a cold context and re-triggering challenges.
+            if self._cf_gate is not None:
+                self._cf_gate.rearm(reason="driver_restart")
             self._browser = None
             if self._uses_camoufox_backend:
                 await camoufox_backend.close_all_launchers(self._camoufox_launchers)
@@ -658,6 +701,17 @@ class PlaywrightEngine:
                         name,
                         page.url,
                     )
+                    if self._tiling_manager is not None:
+                        rect = await self._tiling_manager.assign_page(page)
+                        if rect is not None:
+                            cols, rows = self._tiling_manager._grid.cols, self._tiling_manager._grid.rows
+                            self._emit_signal(
+                                pw_signals.page_tiled,
+                                context_name=pw_ctx.name,
+                                slot_index=self._tiling_manager._slots.get(page),
+                                rect=(rect.x, rect.y, rect.width, rect.height),
+                                grid_size=(cols, rows),
+                            )
             logger.debug(
                 "Browser context started: '%s' (persistent=%s backend=%s)",
                 name, persistent, self._browser_type_name,
@@ -732,13 +786,25 @@ class PlaywrightEngine:
                 context_page_count=len(pw_ctx.context.pages),
                 total_page_count=self.get_total_page_count(),
             )
+            
+            if self._tiling_manager is not None:
+                rect = await self._tiling_manager.assign_page(page)
+                if rect is not None:
+                    cols, rows = self._tiling_manager._grid.cols, self._tiling_manager._grid.rows
+                    self._emit_signal(
+                        pw_signals.page_tiled,
+                        context_name=pw_ctx.name,
+                        slot_index=self._tiling_manager._slots.get(page),
+                        rect=(rect.x, rect.y, rect.width, rect.height),
+                        grid_size=(cols, rows),
+                    )
 
         return page, pw_ctx, is_new
 
     def should_close_page(self, request: Request) -> bool:
-        return self._close_page_after_request and not request.meta.get(
-            "playwright_include_page",
-        )
+        if request.meta.get("playwright_include_page"):
+            return False
+        return self._close_page_after_request
 
     async def return_or_close_page(self, request: Request, page: Page) -> None:
         context_name = request.meta.get("playwright_context", DEFAULT_CONTEXT_NAME)
@@ -747,11 +813,11 @@ class PlaywrightEngine:
             self._inc_stat("playwright/page_count/closed")
             return
         if self.should_close_page(request):
-            logger.debug(
-                "[Lifecycle] Closing page after request due to config "
-                "(context='%s', url=%s)",
-                context_name,
-                page.url,
+            import traceback
+            stack = "".join(traceback.format_stack()[:-1])
+            logger.warning(
+                "[Lifecycle] VERY VERBOSE LOG: Closing page after request due to config "
+                f"(context='{context_name}', url={page.url}). Stack:\n{stack}"
             )
             await page.close()
             self._inc_stat("playwright/page_count/closed")
@@ -771,7 +837,19 @@ class PlaywrightEngine:
             )
             pw_ctx.return_page(page)
             self._inc_stat("playwright/page_count/returned_to_pool")
+            logger.info(
+                "[Lifecycle] Page returned to pool and ready for reuse "
+                "(context='%s', url=%s)",
+                context_name,
+                page.url,
+            )
         else:
+            import traceback
+            stack = "".join(traceback.format_stack()[:-1])
+            logger.warning(
+                "[Lifecycle] VERY VERBOSE LOG: Closing page after request because it could not be returned to pool or retained "
+                f"(context='{context_name}', url={page.url}). Stack:\n{stack}"
+            )
             await page.close()
             self._inc_stat("playwright/page_count/closed")
 
@@ -825,7 +903,7 @@ class PlaywrightEngine:
                     current_url,
                     seed_url,
                 )
-                await page.goto(seed_url, wait_until="domcontentloaded")
+                await self._seed_carrier_page(page, pw_ctx, seed_url, context_name)
             else:
                 logger.debug(
                     "[Fetch] Reusing retained page in context '%s' for fetch "
@@ -839,7 +917,7 @@ class PlaywrightEngine:
         if is_new:
             self._inc_stat("playwright/page_count")
             self._register_page(page, pw_ctx, spider=spider)
-        await page.goto(seed_url, wait_until="domcontentloaded")
+        await self._seed_carrier_page(page, pw_ctx, seed_url, context_name)
         pw_ctx.retain_page(page)
         logger.debug(
             "[Fetch] Retained new fetch carrier page (context='%s', url=%s)",
@@ -847,6 +925,59 @@ class PlaywrightEngine:
             page.url,
         )
         return page
+
+    async def _seed_carrier_page(
+        self,
+        page: Page,
+        pw_ctx: PlaywrightContext,
+        seed_url: str,
+        context_name: str,
+    ) -> None:
+        """Navigate the carrier *page* to *seed_url* with bounded retries.
+
+        A Cloudflare interstitial on the seed navigation can hang ``page.goto``
+        for the full navigation timeout. Rather than letting that single
+        timeout drop the request (the spider would lose that listing's
+        pagination), retry a couple of times with a short backoff. On final
+        failure the broken page is forgotten/closed so the next request seeds a
+        fresh one instead of reusing a stuck page.
+        """
+        attempts = self._fetch_seed_max_attempts
+        timeout = self._fetch_seed_timeout_ms
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                await page.goto(
+                    seed_url, wait_until="domcontentloaded", timeout=timeout,
+                )
+                return
+            except PlaywrightTimeoutError as exc:
+                last_exc = exc
+                self._inc_stat("playwright/fetch_seed_timeout_count")
+                is_final = attempt >= attempts
+                logger.warning(
+                    "[Fetch] Seed navigation timed out (context=%s seed=%s "
+                    "attempt=%d/%d timeout=%dms)",
+                    context_name, seed_url, attempt, attempts, timeout,
+                )
+                self._emit_signal(
+                    pw_signals.fetch_seed_timeout,
+                    context_name=context_name,
+                    seed_url=seed_url,
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    timeout_ms=timeout,
+                    final=is_final,
+                )
+                if not is_final:
+                    await asyncio.sleep(self._fetch_seed_retry_delay_s)
+
+        # Exhausted retries: drop the stuck carrier page so the next request
+        # starts from a clean one, then surface the failure to the caller.
+        pw_ctx.forget_page(page)
+        with suppress(Exception):
+            await page.close()
+        raise last_exc  # type: ignore[misc]
 
     def _register_page(
         self,
@@ -1230,7 +1361,19 @@ class PlaywrightEngine:
     async def download_with_fetch(
         self, request: Request, spider: Spider,
     ) -> Response:
-        """Execute *request* as a ``fetch()`` call inside the browser."""
+        """Execute *request* as a ``fetch()`` call inside the browser.
+
+        Serialized per context on the carrier page: seeding the page and
+        running the in-page ``fetch()`` must not interleave with another
+        request driving the same retained page.
+        """
+        pw_ctx = await self.get_or_create_context(request, spider)
+        async with pw_ctx.fetch_lock:
+            return await self._download_with_fetch_locked(request, spider)
+
+    async def _download_with_fetch_locked(
+        self, request: Request, spider: Spider,
+    ) -> Response:
         start_time = time()
         page = await self.get_or_create_fetch_page(request, spider)
         credentials_mode = request.meta.get("playwright_fetch_credentials", "include")
@@ -1697,6 +1840,16 @@ class PlaywrightEngine:
         self, context_name: str, tracked_page: Optional[Page] = None
     ) -> Callable:
         def cb(page: Optional[Page] = None) -> None:
+            p = page or tracked_page
+            url = p.url if p else "unknown"
+            logger.warning(
+                "[Lifecycle] VERY VERBOSE LOG: PAGE CLOSED EVENT RECEIVED FROM BROWSER. "
+                "The browser window was closed internally by the browser itself, the OS, or a user clicking the X button. "
+                "Page closed: '%s' (context: '%s')",
+                url, context_name
+            )
+            if page and self._tiling_manager is not None:
+                self._tiling_manager.release_page(page)
             pw_ctx = self.contexts.get(context_name)
             if pw_ctx is not None:
                 pw_ctx.forget_page(page or tracked_page)

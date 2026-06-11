@@ -162,6 +162,21 @@ class CloudflareBypass:
         challenge_type = classify_challenge(response)
         if challenge_type == ChallengeType.NONE:
             return response
+
+        # A challenge after the gate already opened means Cloudflare
+        # re-escalated mid-run. Re-close the gate so subsequent requests
+        # serialize through a solve cycle instead of racing the carrier page.
+        cf_gate = getattr(self._engine, "_cf_gate", None)
+        if cf_gate is not None:
+            cf_gate.rearm(
+                **self._event_attrs(
+                    request,
+                    context_name=context_name,
+                    challenge_type=challenge_type,
+                    response=response,
+                ),
+            )
+
         if challenge_type == ChallengeType.PLAIN_403:
             await self._emit_blocked_and_remediate(
                 **self._event_attrs(

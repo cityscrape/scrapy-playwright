@@ -5,13 +5,25 @@ from logging import Logger
 from typing import Any
 from typing import Callable, Dict, Tuple, Type, Union
 
-from playwright.async_api import (
-    Page,
-)
+from playwright.async_api import BrowserContext, Page
+from playwright.async_api import Error as PlaywrightError
 
-__all__ = ["PageMethod"]
-
-from playwright.async_api import BrowserContext
+async def _create_page_as_window(context: BrowserContext, logger: Logger) -> Page:
+    """Helper to create a new page as an OS window if possible."""
+    if not context.pages:
+        logger.debug("No base page available, creating normal tab.")
+        return await context.new_page()
+    
+    base_page = context.pages[0]
+    try:
+        async with context.expect_page() as page_info:
+            await base_page.evaluate("window.open('about:blank', '_blank', 'popup=yes')")
+        page = await page_info.value
+        logger.debug("Created new page as popup window.")
+        return page
+    except Exception as e:
+        logger.warning(f"Failed to create popup window, falling back to new_page: {e}")
+        return await context.new_page()
 
 
 class PageMethod:
@@ -108,7 +120,7 @@ class ReuseFirstStrategy(PoolStrategy):
             "(sem_value=%d)",
             self.name, semaphore._value,
         )
-        page = await context.new_page()
+        page = await _create_page_as_window(context, logger)
         return page, True
 
 
@@ -132,7 +144,7 @@ class CreateFirstStrategy(PoolStrategy):
         # Create a new page while semaphore has capacity (non-blocking check)
         if not _sem_locked:
             await semaphore.acquire()
-            page = await context.new_page()
+            page = await _create_page_as_window(context, logger)
             logger.debug(
                 "[PagePool:%s] ACQUIRE create_first → CREATED new page "
                 "(sem_was=%d, sem_now=%d, idle_available=%d)",
@@ -294,6 +306,11 @@ class PagePool:
             page = self._idle.get_nowait()
             if not page.is_closed():
                 with suppress(Exception):
+                    import traceback
+                    stack = "".join(traceback.format_stack()[:-1])
+                    self.logger.warning(
+                        f"[PagePool:drain] VERY VERBOSE LOG: Closing idle page {page.url} because the pool is draining. Stack:\n{stack}"
+                    )
                     await page.close()
                 _closed += 1
         self.logger.debug(

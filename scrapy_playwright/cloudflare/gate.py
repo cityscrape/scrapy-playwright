@@ -7,6 +7,7 @@ can coexist with an active Cloudflare challenge.
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, Callable, Optional
 
 from scrapy_playwright.cloudflare.types import ChallengeType, classify_challenge
@@ -28,12 +29,26 @@ class CfGate:
     """
 
     def __init__(self, enabled: bool, emit_signal: Optional[Callable] = None) -> None:
+        self._enabled = enabled
         self._event = asyncio.Event()
         self._serial_lock = asyncio.Lock()
         self._emit_signal = emit_signal
+        # Telemetry: how much traffic a clearance sustained before re-flagging.
+        self._opened_at: Optional[float] = None
+        self._requests_since_open = 0
         if not enabled:
             # Gate starts open when CF retry is disabled.
             self._event.set()
+
+    def note_request(self) -> None:
+        """Count a download served while the gate is open.
+
+        Called once per Playwright download by the handler. The running total
+        is reported as ``requests_since_clearance`` when the gate re-arms, so
+        experiments can read off how many requests a clearance survived.
+        """
+        if self._event.is_set():
+            self._requests_since_open += 1
 
     @staticmethod
     def _header_to_str(value) -> Optional[str]:
@@ -56,8 +71,50 @@ class CfGate:
     def open(self, **event_attrs) -> None:
         logger.info("[CfGate] clearance validated — allowing parallel requests")
         self._event.set()
+        self._opened_at = time.monotonic()
+        self._requests_since_open = 0
         if self._emit_signal is not None:
             self._emit_signal(pw_signals.cloudflare_gate_opened, **event_attrs)
+
+    def rearm(self, *, reason: str = "re_challenge", **event_attrs) -> None:
+        """Re-close an open gate after a fresh challenge is observed.
+
+        The gate is a latch that opens once clearance is validated; without
+        re-closing it, a later Cloudflare re-escalation (passive → interstitial
+        Turnstile) lets every concurrent request keep hammering the carrier
+        page. Re-closing forces subsequent requests back through the serial
+        solve cycle, restoring backpressure. No-op when CF retry is disabled
+        (the gate is intentionally always-open in that mode).
+
+        Emits :data:`cloudflare_gate_rearmed` with the request/time budget the
+        clearance sustained — the core measurement for aggressiveness tests.
+        """
+        if not self._enabled:
+            return
+        if not self._event.is_set():
+            return
+        seconds_since_clearance = (
+            time.monotonic() - self._opened_at if self._opened_at is not None else None
+        )
+        requests_since_clearance = self._requests_since_open
+        logger.warning(
+            "[CfGate] re-challenge observed (reason=%s) — re-closing gate to "
+            "re-serialize requests (served %d requests over %s s since clearance)",
+            reason,
+            requests_since_clearance,
+            f"{seconds_since_clearance:.1f}" if seconds_since_clearance is not None else "?",
+        )
+        self._event.clear()
+        self._opened_at = None
+        self._requests_since_open = 0
+        if self._emit_signal is not None:
+            self._emit_signal(
+                pw_signals.cloudflare_gate_rearmed,
+                reason=reason,
+                requests_since_clearance=requests_since_clearance,
+                seconds_since_clearance=seconds_since_clearance,
+                **event_attrs,
+            )
 
     async def maybe_open(self, response: Optional["Response"], **event_attrs) -> None:
         """Open the gate if *response* is no longer challenged by Cloudflare."""

@@ -59,6 +59,16 @@ Keyword arguments:
 * ``total_page_count``   — page count across all contexts after creation.
 """
 
+page_tiled = object()
+"""Fired after a page window has been positioned in the tiling grid.
+
+Keyword arguments:
+* ``context_name`` — name of the owning context.
+* ``slot_index``   — grid slot assigned to this page.
+* ``rect``         — (x, y, width, height) of the window.
+* ``grid_size``    — (cols, rows) of the current grid.
+"""
+
 # ── Download lifecycle ──────────────────────────────────────────────
 
 download_started = object()
@@ -104,6 +114,23 @@ Keyword arguments:
 * ``duration`` — elapsed time in seconds (float).
 """
 
+fetch_seed_timeout = object()
+"""Fired when a carrier-page seed navigation (``page.goto(seed_url)``) times out.
+
+A timeout here almost always means the carrier page is stuck on a Cloudflare
+interstitial rather than reaching the listing page — a strong signal that the
+session is being actively challenged. Tracking its rate against request rate
+helps locate the aggressiveness threshold.
+
+Keyword arguments:
+* ``context_name`` — logical name of the context.
+* ``seed_url``     — URL being navigated to.
+* ``attempt``      — 1-based attempt number.
+* ``max_attempts`` — configured attempt budget.
+* ``timeout_ms``   — per-attempt navigation timeout in milliseconds.
+* ``final``        — ``True`` when this was the last attempt and it failed.
+"""
+
 # ── Failure / recovery ─────────────────────────────────────────────
 
 browser_disconnected = object()
@@ -147,6 +174,28 @@ Keyword arguments:
 * ``challenge_type`` — classification of the final response (normally ``"none"``).
 * ``status``         — response status code.
 * ``resp_url``       — final response URL.
+"""
+
+cloudflare_gate_rearmed = object()
+"""Fired when an already-open pre-clearance gate is re-closed.
+
+This is the key "Cloudflare started flagging us again" marker: it means the
+session previously had clearance (the gate was open and requests ran in
+parallel) and then Cloudflare re-escalated — passive checks turned into an
+interstitial/challenge — or the browser driver restarted onto a cold context.
+The ``requests_since_clearance`` / ``seconds_since_clearance`` fields capture
+how much traffic the session sustained before being flagged, which is the
+primary measurement for request-rate aggressiveness experiments.
+
+Keyword arguments:
+* ``context_name``             — logical name of the context.
+* ``mode``                     — ``"page"`` or ``"fetch"`` (when known).
+* ``challenge_type``           — challenge classification that triggered it,
+  or ``None`` for non-challenge causes (e.g. driver restart).
+* ``reason``                   — coarse cause, e.g. ``"re_challenge"`` or
+  ``"driver_restart"``.
+* ``requests_since_clearance`` — downloads served since the gate last opened.
+* ``seconds_since_clearance``  — wall-clock seconds the gate stayed open.
 """
 
 cloudflare_challenge_detected = object()

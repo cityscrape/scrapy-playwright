@@ -69,8 +69,12 @@ class Config:
     navigation_timeout: Optional[float]
     restart_disconnected_browser: bool
     close_page_after_request: bool
-    page_pooling: bool = False
     page_pool_strategy: str = POOL_STRATEGY_REUSE_FIRST
+    tiling_enabled: bool = True
+    tiling_screen_width: Optional[int] = None
+    tiling_screen_height: Optional[int] = None
+    tiling_margin: int = 0
+    tiling_adjust_viewport: bool = True
     target_closed_max_retries: int = 3
     use_threaded_loop: bool = False
     har_recording: bool = False
@@ -114,10 +118,14 @@ class Config:
             close_page_after_request=settings.getbool(
                 "PLAYWRIGHT_CLOSE_PAGE_AFTER_REQUEST", default=False
             ),
-            page_pooling=settings.getbool("PLAYWRIGHT_PAGE_POOLING", default=False),
             page_pool_strategy=settings.get(
                 "PLAYWRIGHT_PAGE_POOL_STRATEGY", POOL_STRATEGY_REUSE_FIRST
             ),
+            tiling_enabled=settings.getbool("PLAYWRIGHT_TILING_ENABLED", default=True),
+            tiling_screen_width=settings.getint("PLAYWRIGHT_TILING_SCREEN_WIDTH") or None,
+            tiling_screen_height=settings.getint("PLAYWRIGHT_TILING_SCREEN_HEIGHT") or None,
+            tiling_margin=settings.getint("PLAYWRIGHT_TILING_MARGIN", 0),
+            tiling_adjust_viewport=settings.getbool("PLAYWRIGHT_TILING_ADJUST_VIEWPORT", default=True),
             use_threaded_loop=platform.system() == "Windows"
                               or settings.getbool("_PLAYWRIGHT_THREADED_LOOP", False),
             har_recording=settings.getbool("PLAYWRIGHT_HAR_RECORDING", default=False),
@@ -161,6 +169,14 @@ class Config:
                 f"Invalid PLAYWRIGHT_BROWSER_TYPE: {cfg.browser_type_name!r}. "
                 f"Valid values: {', '.join(sorted(VALID_BROWSER_TYPES))}"
             )
+        
+        if "PLAYWRIGHT_PAGE_POOLING" in settings:
+            logger.warning(
+                "PLAYWRIGHT_PAGE_POOLING is deprecated and ignored. "
+                "Page pooling is always active. Use PLAYWRIGHT_CLOSE_PAGE_AFTER_REQUEST "
+                "to control page lifecycle."
+            )
+
         if not cfg.max_pages_per_context:
             cfg.max_pages_per_context = settings.getint("CONCURRENT_REQUESTS")
         if (cfg.cdp_url or cfg.connect_url) and cfg.launch_options:
@@ -271,6 +287,8 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                 enabled=self.config.cf_challenge_retry,
                 emit_signal=self._emit_signal,
             )
+            # Let the engine's bypass re-close the gate on re-challenge.
+            pw._cf_gate = cf_gate
 
             shared = {
                 "pw": pw,
@@ -456,6 +474,11 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         that the gate opens and requests proceed in parallel.
         """
         spider = spider or self._crawler.spider
+
+        # Count traffic served under the current clearance (reported when the
+        # gate re-arms) so experiments can read off the request budget that a
+        # clearance sustained before Cloudflare re-flagged the session.
+        self._cf_gate.note_request()
 
         if not self._cf_gate.is_open:
             async with self._cf_gate.serial_lock:
