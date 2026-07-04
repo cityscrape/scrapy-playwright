@@ -1537,6 +1537,10 @@ class PlaywrightEngine:
         resp_body_text = result.get("body", "")
         body_bytes, encoding = _encode_body(headers=resp_headers, text=resp_body_text)
         request.meta["download_latency"] = elapsed
+        # In-page fetch() follows redirects transparently, so Scrapy's
+        # RedirectMiddleware never sees a 3xx — expose the outcome via meta.
+        request.meta["playwright_fetch_redirected"] = bool(result.get("redirected"))
+        request.meta["playwright_fetch_final_url"] = result.get("finalUrl")
         self._emit_signal(
             pw_signals.fetch_executed,
             url=request.url,
