@@ -36,9 +36,17 @@ class CfGate:
         # Telemetry: how much traffic a clearance sustained before re-flagging.
         self._opened_at: Optional[float] = None
         self._requests_since_open = 0
+        # When the gate is closed, the monotonic timestamp of the closure. Used
+        # by the watchdog to force a re-probe after a cooldown so a persistent
+        # challenge (notably private-token, which has no solve path) cannot
+        # latch the gate closed forever and collapse throughput to zero.
+        self._closed_at: Optional[float] = None
         if not enabled:
             # Gate starts open when CF retry is disabled.
             self._event.set()
+        else:
+            # Gate starts closed when CF retry is enabled.
+            self._closed_at = time.monotonic()
 
     def note_request(self) -> None:
         """Count a download served while the gate is open.
@@ -68,13 +76,54 @@ class CfGate:
     def serial_lock(self) -> asyncio.Lock:
         return self._serial_lock
 
+    @property
+    def seconds_closed(self) -> Optional[float]:
+        """Seconds the gate has been continuously closed, or ``None`` if open."""
+        if self._event.is_set() or self._closed_at is None:
+            return None
+        return time.monotonic() - self._closed_at
+
+    def cooldown_elapsed(self, threshold_s: float) -> bool:
+        """True if the gate has been closed for at least *threshold_s* seconds."""
+        closed_for = self.seconds_closed
+        return closed_for is not None and closed_for >= threshold_s
+
     def open(self, **event_attrs) -> None:
         logger.info("[CfGate] clearance validated — allowing parallel requests")
         self._event.set()
         self._opened_at = time.monotonic()
         self._requests_since_open = 0
+        self._closed_at = None
         if self._emit_signal is not None:
             self._emit_signal(pw_signals.cloudflare_gate_opened, **event_attrs)
+
+    def force_reset(self, *, reason: str = "forced", **event_attrs) -> bool:
+        """Force the gate open so traffic re-probes, regardless of state.
+
+        The gate is otherwise a latch that only opens on an unchallenged
+        response (:meth:`maybe_open`). A persistent challenge with no solve
+        path — private-token (PAT) being the prime case — keeps every response
+        classified as a challenge, so the gate would stay closed forever and
+        every request serializes at ~0 throughput. Remediation completion and
+        the closed-gate watchdog call this to break that latch and let a fresh
+        profile/clearance attempt run. No-op when CF retry is disabled (the gate
+        is intentionally always-open in that mode) or already open.
+
+        Returns ``True`` if the gate was actually re-opened by this call.
+        """
+        if not self._enabled:
+            return False
+        if self._event.is_set():
+            return False
+        seconds_closed = self.seconds_closed
+        logger.warning(
+            "[CfGate] force-reset (reason=%s) — re-opening gate after %s s closed "
+            "to allow a re-probe",
+            reason,
+            f"{seconds_closed:.1f}" if seconds_closed is not None else "?",
+        )
+        self.open(**event_attrs)
+        return True
 
     def rearm(self, *, reason: str = "re_challenge", **event_attrs) -> None:
         """Re-close an open gate after a fresh challenge is observed.
@@ -107,6 +156,7 @@ class CfGate:
         self._event.clear()
         self._opened_at = None
         self._requests_since_open = 0
+        self._closed_at = time.monotonic()
         if self._emit_signal is not None:
             self._emit_signal(
                 pw_signals.cloudflare_gate_rearmed,

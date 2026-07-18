@@ -172,6 +172,11 @@ class RemediationManager:
                     return
                 self._engine._inc_stat("playwright/antibot/remediation/completed_count")
                 self._engine._inc_stat(f"playwright/antibot/remediation/{action.name}/completed_count")
+                # The remediation tore down + rebuilt the context. Drop the stale
+                # per-context challenge state and force the (latched) gate back
+                # open so the fresh profile re-probes instead of inheriting a
+                # poisoned attempt_count / staying serialized at ~0 throughput.
+                self._reset_challenge_state(event.context_name)
                 self._engine._emit_signal(
                     pw_signals.antibot_remediation_completed,
                     **selected_attrs,
@@ -198,6 +203,17 @@ class RemediationManager:
 
         action, reason = skipped[0] if skipped else (None, "no_applicable_action")
         self._emit_skipped(event, action, reason)
+
+    def _reset_challenge_state(self, context_name: str) -> None:
+        """Clear cached CF challenge state and re-open the gate after a
+        completed remediation. Guards for the CF-retry-disabled case where the
+        bypass / gate are not attached to the engine."""
+        bypass = getattr(self._engine, "_cf_bypass", None)
+        if bypass is not None:
+            bypass.reset_context(context_name)
+        gate = getattr(self._engine, "_cf_gate", None)
+        if gate is not None:
+            gate.force_reset(reason="remediation_completed")
 
     def _emit_skipped(
         self,

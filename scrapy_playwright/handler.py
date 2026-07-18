@@ -86,6 +86,7 @@ class Config:
     cf_seed_url: Optional[str] = None
     cf_seed_timeout: int = 90_000
     cf_wait_timeout: int = 60_000
+    cf_gate_cooldown_s: float = 120.0
     antibot_remediation_enabled: bool = False
     antibot_remediation_actions: Optional[list] = None
     profile_rotation_archive_dir: Optional[str] = None
@@ -142,6 +143,9 @@ class Config:
             cf_seed_url=settings.get("PLAYWRIGHT_CLOUDFLARE_SEED_URL"),
             cf_seed_timeout=settings.getint("PLAYWRIGHT_CLOUDFLARE_SEED_TIMEOUT", 90_000),
             cf_wait_timeout=settings.getint("PLAYWRIGHT_CLOUDFLARE_WAIT_TIMEOUT", 60_000),
+            cf_gate_cooldown_s=settings.getfloat(
+                "PLAYWRIGHT_CLOUDFLARE_GATE_COOLDOWN_S", 120.0
+            ),
             antibot_remediation_enabled=settings.getbool(
                 "PLAYWRIGHT_ANTIBOT_REMEDIATION_ENABLED",
                 default=settings.getbool("PLAYWRIGHT_CLOUDFLARE_CHALLENGE_RETRY", default=False),
@@ -360,6 +364,12 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
     def from_crawler(cls: Type[PlaywrightHandler], crawler: Crawler) -> PlaywrightHandler:
         return cls(crawler)
 
+    @classmethod
+    def shared_engine(cls, crawler: Crawler) -> Optional[PlaywrightEngine]:
+        """Return the crawler's shared Playwright engine, if launched."""
+        shared = cls._shared_by_crawler_id.get(id(crawler))
+        return shared["pw"] if shared else None
+
     def _deferred_from_coro(self, coro: Awaitable) -> Deferred:
         if self.config.use_threaded_loop:
             return _ThreadedLoopAdapter._deferred_from_coro(coro)
@@ -393,9 +403,25 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
                 self.config.browser_type_name,
                 self._crawler_id,
             )
-            await self.pw.launch(
-                startup_context_kwargs=self.config.startup_context_kwargs or None,
-            )
+            try:
+                await self.pw.launch(
+                    startup_context_kwargs=self.config.startup_context_kwargs or None,
+                )
+            except Exception:
+                # Without a browser the spider can only idle browserless and
+                # then "succeed" with zero items (this shipped once: camoufox
+                # baked out of the image → InvalidAddonPath swallowed by the
+                # signal dispatcher, Argo workflow green). Exit non-zero so
+                # the pod/workflow fails visibly.
+                # ponytail: hard exit, no retry — a broken browser install
+                # never heals within the pod's lifetime.
+                logger.critical(
+                    "[Lifecycle] Playwright facade failed to launch; "
+                    "terminating (crawler_id=%s)",
+                    self._crawler_id,
+                    exc_info=True,
+                )
+                os._exit(78)  # EX_CONFIG: unrecoverable image/runtime misconfiguration
             self._shared_state["launched"] = True
             self.stats.set_value("playwright/page_count", self.pw.get_total_page_count())
             self._crawler.signals.send_catch_log(
@@ -481,6 +507,22 @@ class ScrapyPlaywrightDownloadHandler(HTTP11DownloadHandler):
         self._cf_gate.note_request()
 
         if not self._cf_gate.is_open:
+            # Watchdog: a persistent challenge with no solve path (private-token
+            # being the prime case) keeps the gate latched closed and serializes
+            # every request at ~0 throughput. After a cooldown of continuous
+            # closure, force the gate open so traffic re-probes (at the reduced
+            # concurrency configured for the CF context) instead of collapsing to
+            # zero. Force-resetting mid-solve is safe: parallel requests park
+            # behind the active solve via ``wait_if_solving``. Set the cooldown to
+            # 0 to disable.
+            cooldown = self.config.cf_gate_cooldown_s
+            if cooldown > 0 and self._cf_gate.cooldown_elapsed(cooldown):
+                if self._cf_gate.force_reset(reason="watchdog_cooldown"):
+                    self.stats.inc_value(
+                        "playwright/cloudflare/gate_watchdog_reset_count"
+                    )
+                    return await self._do_download(request, spider)
+
             async with self._cf_gate.serial_lock:
                 if not self._cf_gate.is_open:
                     logger.debug(

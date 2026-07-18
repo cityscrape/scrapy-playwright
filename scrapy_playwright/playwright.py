@@ -62,6 +62,22 @@ PERSISTENT_CONTEXT_PATH_KEY = "user_data_dir"
 CAMOUFOX_BROWSER_TYPE = "camoufox"
 
 
+def page_loaned_to_callback(request: Request) -> bool:
+    """True when the page must survive the download and reach the callback.
+
+    Two metas grant the loan:
+      - ``playwright_include_page``: the callback owns the page and is
+        responsible for closing it (or keeping it retained).
+      - ``playwright_context_seed``: the page is loaned only for the
+        callback's duration; ``SeedPageReleaseMiddleware`` returns it to the
+        context's page pool once the callback's output is consumed.
+    """
+    return bool(
+        request.meta.get("playwright_include_page")
+        or request.meta.get("playwright_context_seed")
+    )
+
+
 # ── Download container ─────────────────────────────────────────────────
 
 class Download:
@@ -802,7 +818,7 @@ class PlaywrightEngine:
         return page, pw_ctx, is_new
 
     def should_close_page(self, request: Request) -> bool:
-        if request.meta.get("playwright_include_page"):
+        if page_loaned_to_callback(request):
             return False
         return self._close_page_after_request
 
@@ -852,6 +868,28 @@ class PlaywrightEngine:
             )
             await page.close()
             self._inc_stat("playwright/page_count/closed")
+
+    def release_loaned_page(self, request: Request, page: Page) -> None:
+        """Return a context-seed page to its pool after the callback ran.
+
+        Idempotent: only acts while the page is still retained, so a callback
+        that closed the page itself (or a later duplicate call) is a no-op.
+        Called by ``SeedPageReleaseMiddleware``.
+        """
+        context_name = request.meta.get("playwright_context", DEFAULT_CONTEXT_NAME)
+        pw_ctx = self.contexts.get(context_name)
+        if pw_ctx is None or not pw_ctx.is_retained_page(page):
+            return
+        pw_ctx.forget_page(page)
+        if not page.is_closed():
+            pw_ctx.return_page(page)
+            self._inc_stat("playwright/page_count/returned_to_pool")
+        logger.debug(
+            "[Lifecycle] Seed page released back to pool "
+            "(context='%s', url=%s)",
+            context_name,
+            page.url if not page.is_closed() else "<closed>",
+        )
 
     # ── Fetch-style download ──────────────────────────────────────────
 
@@ -917,7 +955,19 @@ class PlaywrightEngine:
         if is_new:
             self._inc_stat("playwright/page_count")
             self._register_page(page, pw_ctx, spider=spider)
-        await self._seed_carrier_page(page, pw_ctx, seed_url, context_name)
+        # A pool page may already sit on the seed host (e.g. a released
+        # context-seed page); reuse its warmed state instead of re-navigating.
+        current_host = urlparse(page.url or "").netloc
+        seed_host = urlparse(seed_url).netloc
+        if (page.url or "") == "about:blank" or not seed_host or current_host != seed_host:
+            await self._seed_carrier_page(page, pw_ctx, seed_url, context_name)
+        else:
+            logger.debug(
+                "[Fetch] Pool page already on seed host; skipping seed "
+                "navigation (context='%s', page=%s)",
+                context_name,
+                page.url,
+            )
         pw_ctx.retain_page(page)
         logger.debug(
             "[Fetch] Retained new fetch carrier page (context='%s', url=%s)",
@@ -1597,14 +1647,22 @@ class PlaywrightEngine:
         try:
             return await self._navigate_and_build_response(request, page, spider)
         except Exception:
-            if not request.meta.get("playwright_include_page") and not page.is_closed():
+            # Seed pages are only loaned for the callback's duration; on a
+            # failed download the callback never runs, so reclaim them here
+            # like any pool page (plain include_page still leaves the page to
+            # the spider's errback).
+            reclaim = (
+                request.meta.get("playwright_context_seed")
+                or not request.meta.get("playwright_include_page")
+            )
+            if reclaim and not page.is_closed():
                 await self.return_or_close_page(request, page)
             raise
 
     async def _navigate_and_build_response(
         self, request: Request, page: Page, spider: Spider,
     ) -> Response:
-        if request.meta.get("playwright_include_page"):
+        if page_loaned_to_callback(request):
             request.meta["playwright_page"] = page
 
         start_time = time()
@@ -1638,7 +1696,7 @@ class PlaywrightEngine:
         if download and download.exception:
             raise download.exception
 
-        if request.meta.get("playwright_include_page"):
+        if page_loaned_to_callback(request):
             context_name = request.meta.get("playwright_context", DEFAULT_CONTEXT_NAME)
             pw_ctx = self.contexts.get(context_name)
             if pw_ctx is not None:

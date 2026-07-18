@@ -224,6 +224,24 @@ class CloudflareBypass:
             request, response, spider, context_name, challenge_type, dispatch_fn,
         )
 
+    def reset_context(self, context_name: str) -> None:
+        """Drop all cached challenge state for *context_name*.
+
+        Called after a remediation (e.g. profile rotation) tears down and
+        rebuilds a context. Without this, the rebuilt context inherits the old
+        :class:`ContextChallengeInfo` — a poisoned ``attempt_count`` past
+        ``max_retries``, a stale ``FAILED`` state, and a ``carrier_page`` that
+        points at a now-closed page — so the fresh profile can never solve
+        again. Dropping the entry lets the next challenge start a clean episode.
+        """
+        removed = self._challenge_info.pop(context_name, None)
+        if removed is not None:
+            logger.info(
+                "[Cloudflare] Reset challenge state for context '%s' "
+                "(was state=%s attempt_count=%d)",
+                context_name, removed.state.value, removed.attempt_count,
+            )
+
     # ── Per-context state helpers ──────────────────────────────────────
 
     def _get_info(self, context_name: str) -> ContextChallengeInfo:
@@ -276,6 +294,23 @@ class CloudflareBypass:
                     info.attempt_count, info.challenge_type.value,
                 )
             else:
+                # Start of a fresh solve episode. ``attempt_count`` bounds
+                # retries *within* an episode and trips ``max_retries`` to give
+                # up + remediate. It must reset when a prior episode resolved,
+                # otherwise it is a monotonic lifetime counter: after
+                # ``max_retries`` total solves the handler short-circuits at the
+                # ``attempt_count > max_retries`` check forever and the solve
+                # path is permanently disabled (the "decay to zero" latch).
+                # Reset only when the previous outcome was IDLE/VALIDATED (a new,
+                # unrelated escalation); consecutive FAILED cycles keep
+                # accumulating so the give-up backstop still fires.
+                if info.state in (ChallengeState.IDLE, ChallengeState.VALIDATED):
+                    info.attempt_count = 0
+                    # Drop a carrier page left dead by a prior rotation/close so
+                    # ``_solve`` re-acquires a live page instead of navigating a
+                    # closed one.
+                    if info.carrier_page is not None and info.carrier_page.is_closed():
+                        info.carrier_page = None
                 info.state = ChallengeState.SOLVING
                 info.challenge_type = challenge_type
                 info.attempt_count += 1
@@ -473,6 +508,30 @@ class CloudflareBypass:
         )
         self._diagnostics.log_context_pages(pw_ctx, "pre_solve_pages")
 
+        # Serialize carrier-page driving against playwright_fetch. This solve
+        # navigates the same retained carrier page that ``download_with_fetch``
+        # drives under ``pw_ctx.fetch_lock``; without taking the lock here, a
+        # concurrent fetch and this solve race a single Playwright page →
+        # ``Page.goto`` timeouts and fetch errors. Lock ordering is safe and
+        # cycle-free: the fetch path holds ``fetch_lock`` and never acquires the
+        # solve lock (the solve runs *after* the fetch releases ``fetch_lock`` in
+        # ``PlaywrightEngine.process``). Acquire with a timeout so a wedged
+        # holder degrades to the previous racy behavior instead of hanging the
+        # solver forever.
+        fetch_lock_held = False
+        try:
+            await asyncio.wait_for(
+                pw_ctx.fetch_lock.acquire(),
+                timeout=(self._wait_timeout / 1000.0) + 30.0,
+            )
+            fetch_lock_held = True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Cloudflare] Timed out acquiring fetch_lock for solve "
+                "(context='%s'); proceeding without it",
+                pw_ctx.name,
+            )
+
         try:
             page_title = await page.title()
             title_lower = (page_title or "").lower()
@@ -573,6 +632,8 @@ class CloudflareBypass:
             )
             return False
         finally:
+            if fetch_lock_held:
+                pw_ctx.fetch_lock.release()
             if page_is_new and not page.is_closed():
                 pw_ctx.return_page(page)
 
