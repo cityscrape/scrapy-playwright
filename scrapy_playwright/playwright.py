@@ -413,6 +413,20 @@ class PlaywrightEngine:
     def _uses_camoufox_backend(self) -> bool:
         return self._browser_type_name == CAMOUFOX_BROWSER_TYPE
 
+    @property
+    def _proxy_needs_auth(self) -> bool:
+        """Is egress going through a proxy that requires username/password?
+
+        Only credentialed proxies are affected by the Firefox limitation the
+        route handler works around; an unauthenticated proxy (IP-whitelisted,
+        say) behaves like no proxy at all here.
+        """
+        for options in (self._camoufox_options, self._launch_options):
+            proxy = (options or {}).get("proxy") or {}
+            if isinstance(proxy, dict) and proxy.get("username"):
+                return True
+        return False
+
     # ── Public entry point ─────────────────────────────────────────────
 
     async def process(self, request: Request, spider: Spider) -> Response:
@@ -1872,6 +1886,18 @@ class PlaywrightEngine:
                 headers.update(final_headers)
 
             del final_headers
+            if overrides.get("headers") is not None and self._proxy_needs_auth:
+                # Firefox loses the proxy credentials on *any* `headers=`
+                # override — even one byte-identical to the headers the browser
+                # itself produced — and the navigation dies as a 407 followed by
+                # NS_ERROR_PROXY_CONNECTION_REFUSED. Re-injecting
+                # Proxy-Authorization does not help: Gecko negotiates proxy auth
+                # below the request-header layer, so the override cannot restore
+                # what it removed. Dropping the override is the only way to keep
+                # a credentialed proxy working, and costs us Scrapy-set headers
+                # on intercepted navigation requests only (`playwright_fetch`
+                # issues its own requests and is unaffected).
+                overrides.pop("headers", None)
             try:
                 await route.continue_(**overrides)
             except PlaywrightError as ex:

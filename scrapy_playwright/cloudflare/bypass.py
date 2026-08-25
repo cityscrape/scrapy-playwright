@@ -12,6 +12,7 @@ from time import time
 from typing import TYPE_CHECKING, Dict, Optional
 from urllib.parse import urlparse
 
+from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Page, Response as PlaywrightResponse
 from scrapy import Spider
 from scrapy.http import Request, Response
@@ -626,6 +627,13 @@ class CloudflareBypass:
 
             return await self._validate(pw_ctx, page, request, info)
 
+        except TargetClosedError:
+            logger.info(
+                "[Cloudflare] Solve aborted (context='%s'): context closed "
+                "mid-solve (profile rotation) — returning without clearance",
+                context_name,
+            )
+            return False
         except Exception as exc:
             logger.error(
                 "[Cloudflare] Solve navigation failed: %s", exc, exc_info=True,
@@ -938,7 +946,15 @@ class CloudflareBypass:
         timeout_s = timeout_ms / 1000.0
         poll_count = 0
         while elapsed < timeout_s:
-            cookies = await pw_ctx.context.cookies()
+            try:
+                cookies = await pw_ctx.context.cookies()
+            except TargetClosedError:
+                logger.info(
+                    "[Cloudflare] Clearance poll aborted (context='%s'): "
+                    "context closed mid-solve",
+                    pw_ctx.name,
+                )
+                return False
             poll_count += 1
             if poll_count == 1 or poll_count % 5 == 0:
                 cf_cookie_names = [

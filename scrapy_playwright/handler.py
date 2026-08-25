@@ -152,7 +152,10 @@ class Config:
             ),
             antibot_remediation_actions=settings.getlist(
                 "PLAYWRIGHT_ANTIBOT_REMEDIATION_ACTIONS",
-                ["profile_rotation"],
+                # Order is selection order. egress_drain leads because a PAT is
+                # a verdict about the address, and rotating a profile onto the
+                # same address just draws the next one.
+                ["egress_drain", "profile_rotation"],
             ),
             profile_rotation_archive_dir=settings.get("PLAYWRIGHT_PROFILE_ROTATION_ARCHIVE_DIR"),
             fetch_failure_artifacts_enabled=settings.getbool(

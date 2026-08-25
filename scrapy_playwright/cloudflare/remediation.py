@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import pathlib
 import shutil
 from dataclasses import dataclass
@@ -20,13 +21,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger("scrapy-playwright")
 
 PROFILE_ROTATION_ACTION = "profile_rotation"
+EGRESS_DRAIN_ACTION = "egress_drain"
+
+# Verdicts about *this browser* — a fingerprint or a warmed profile that has
+# gone stale. Rotating the profile is a real answer to these.
+#
+# `private_token_challenge` is deliberately absent. A PAT is a verdict about the
+# *address*: Cloudflare asks the device for an attestation token that no
+# Camoufox build can mint, and it only asks when it already distrusts where the
+# request came from. Rotating the profile relaunches on the same IP and gets
+# challenged again on the next request, which is how a PAT used to burn a run in
+# five seconds and report a "completed" remediation. It is handled by
+# EgressDrainAction instead.
 TERMINAL_ROTATION_REASONS = {
-    "private_token_challenge",
     "cloudflare_max_retries",
     "cloudflare_solve_failed",
     "cloudflare_solve_error",
     "cloudflare_plain_403",
 }
+
+PRIVATE_TOKEN_REASON = "private_token_challenge"
+
+# Hours an address stays drained for the target that saw the PAT. A cooldown
+# rather than a permanent mark: Cloudflare's reputation decays, so the IP comes
+# back on its own and nothing has to un-drain it.
+DEFAULT_DRAIN_COOLDOWN_HOURS = 6.0
 
 
 @dataclass
@@ -99,6 +118,92 @@ class ProfileRotationAction:
         }
 
 
+class EgressDrainAction:
+    """Take the egress out of rotation for the target that drew a PAT.
+
+    Scoped to one target on purpose. A portal's block is evidence about that
+    portal — VivaReal cannot see the requests we send to imovelweb — so draining
+    globally would throw away an address that is still good everywhere else.
+
+    Nothing here tries to satisfy the PAT. There is no in-browser path to one,
+    so the useful move is to stop spending runs on an address that has already
+    been judged and to say plainly which address it was.
+    """
+
+    name = EGRESS_DRAIN_ACTION
+
+    async def applies_to(self, engine: "PlaywrightEngine", event: RemediationInput) -> tuple[bool, str]:
+        if event.blocked_reason != PRIVATE_TOKEN_REASON:
+            return False, "blocked_reason_not_configured"
+        if not os.getenv("SCRAPER_EGRESS_PROXY", "").strip():
+            # A run pointed at a bare SCRAPER_PROXY_URL has no resource to
+            # patch. Degrade quietly rather than failing the remediation.
+            return False, "no_egress_resource"
+        if not _drain_target():
+            return False, "no_target"
+        return True, "selected"
+
+    async def run(self, engine: "PlaywrightEngine", event: RemediationInput) -> dict:
+        from iwantafuckinghouse.egress import resources
+
+        name = os.getenv("SCRAPER_EGRESS_PROXY", "").strip()
+        target = _drain_target()
+        cooldown = float(
+            os.getenv("EGRESS_TARGET_COOLDOWN_H") or DEFAULT_DRAIN_COOLDOWN_HOURS
+        )
+        namespace = resources.namespace_from_env()
+
+        # The patch is a network call to the API server; do not block the loop.
+        def _drain() -> dict:
+            resources.load_kube_config()
+            return resources.mark_target_unhealthy(
+                namespace, name, target, PRIVATE_TOKEN_REASON, cooldown
+            )
+
+        try:
+            patched = await asyncio.get_running_loop().run_in_executor(None, _drain)
+        except Exception as exc:
+            # A drain that cannot be recorded must not look like it worked, or
+            # the next run picks the same dead address straight back up.
+            logger.error(
+                "[Remediation] could not drain egress %s for %s: %s", name, target, exc
+            )
+            return {"outcome": "failed", "egress": name, "target": target, "error": str(exc)}
+
+        observed = (patched.get("status") or {}) if isinstance(patched, dict) else {}
+        spec = (patched.get("spec") or {}) if isinstance(patched, dict) else {}
+        logger.error(
+            "[Remediation] egress %s (%s, %s) drained for %s after a PrivateToken "
+            "challenge; Cloudflare will not accept this address for that target. "
+            "Back in rotation in %sh.",
+            name,
+            spec.get("host") or observed.get("observedIp") or "?",
+            observed.get("observedAsn") or spec.get("asn") or "unknown ASN",
+            target,
+            cooldown,
+        )
+        return {
+            "outcome": "completed",
+            "egress": name,
+            "target": target,
+            "cooldown_hours": cooldown,
+        }
+
+
+def _drain_target() -> str:
+    """The portal this run is scraping, named the way the Lease names it.
+
+    `EGRESS_TARGET` is what claim.py leased under; PLAYWRIGHT_SPIDER_NAME is what
+    a standalone run has. Preferring the former keeps the drain and the lease
+    talking about the same thing.
+    """
+    for var in ("EGRESS_TARGET", "PLAYWRIGHT_SPIDER_NAME", "SPIDER"):
+        value = os.getenv(var, "").strip()
+        if value:
+            return value
+    return ""
+
+
 class RemediationManager:
     """Select and run anti-bot remediation actions with consistent telemetry."""
 
@@ -112,8 +217,13 @@ class RemediationManager:
         self._engine = engine
         self._enabled = enabled
         self._actions = []
-        for action in actions or (PROFILE_ROTATION_ACTION,):
-            if action == PROFILE_ROTATION_ACTION:
+        # Order is selection order: the manager runs the first action whose
+        # applies_to passes, so egress_drain must precede profile_rotation or a
+        # PAT would be swallowed by a rotation that cannot help it.
+        for action in actions or (EGRESS_DRAIN_ACTION, PROFILE_ROTATION_ACTION):
+            if action == EGRESS_DRAIN_ACTION:
+                self._actions.append(EgressDrainAction())
+            elif action == PROFILE_ROTATION_ACTION:
                 self._actions.append(ProfileRotationAction())
             else:
                 logger.warning("[Remediation] Unknown action %r ignored", action)
